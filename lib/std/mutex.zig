@@ -68,7 +68,7 @@ else
             pub fn release(self: Held) void {
                 // since MUTEX_LOCK is the first bit, we can use (.Sub) instead of (.And, ~MUTEX_LOCK).
                 // this is because .Sub may be implemented more efficiently than the latter
-                // (e.g. `lock xadd` vs `cmpxchg` loop on x86)
+                // (e.g. `lock xadd` vs `lock cmpxchg` loop on x86)
                 const state = @atomicRmw(usize, &self.mutex.state, .Sub, MUTEX_LOCK, .Release);
                 if ((state & QUEUE_MASK) != 0 and (state & QUEUE_LOCK) == 0) {
                     self.mutex.releaseSlow(state);
@@ -100,9 +100,10 @@ else
                     if (spin < SPIN_CPU) {
                         std.SpinLock.yield(SPIN_CPU_COUNT);
                     } else {
-                        std.os.sched_yield() catch std.time.sleep(0);
+                        std.os.sched_yield() catch std.time.sleep(10 * std.time.millisecond);
                     }
                     state = @atomicLoad(usize, &self.state, .Monotonic);
+                    spin += 1;
                     continue;
                 }
 
@@ -115,7 +116,7 @@ else
                 const new_state = @ptrToInt(&node) | (state & ~QUEUE_MASK);
                 state = @cmpxchgWeak(usize, &self.state, state, new_state, .Release, .Monotonic) orelse {
                     // node is in the queue, wait until a `held.release()` wakes us up.
-                    _ = node.data.wait(null) catch unreachable;
+                    node.data.wait();
                     spin = 0;
                     state = @atomicLoad(usize, &self.state, .Monotonic);
                     continue;
@@ -147,10 +148,8 @@ else
                 // while at the same time unsetting the QUEUE_LOCK.
                 const node = @intToPtr(*QueueNode, state & QUEUE_MASK);
                 const new_state = @ptrToInt(node.next) | (state & MUTEX_LOCK);
-                state = @cmpxchgWeak(usize, &self.state, state, new_state, .Release, .Monotonic) orelse {
-                    _ = node.data.set(false);
-                    return;
-                };
+                state = @cmpxchgWeak(usize, &self.state, state, new_state, .Release, .Monotonic)
+                    orelse return node.data.set();
             }
         }
     };
