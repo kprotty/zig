@@ -28,29 +28,30 @@ pub const ResetEvent = struct {
         return self.os_event.isSet();
     }
     
-    /// Sets the event if not already set and
-    /// wakes up AT LEAST one thread waiting the event.
-    /// Returns whether or not a thread was woken up.
-    pub fn set(self: *ResetEvent, auto_reset: bool) bool {
-        return self.os_event.set(auto_reset);
+    /// Sets the event if not already set and wakes up at least one thread waiting the event.
+    pub fn set(self: *ResetEvent) void {
+        return self.os_event.set();
     }
 
-    /// Resets the event to its original, unset state.
-    /// Returns whether or not the event was currently set before un-setting.
-    pub fn reset(self: *ResetEvent) bool {
+    /// Resets the event to its original, unset state..
+    pub fn reset(self: *ResetEvent) void {
         return self.os_event.reset();
     }
 
-    const WaitError = error{
+    /// Wait for the event to be set by blocking the current thread.
+    pub fn wait(self: *ResetEvent) void {
+        return self.os_event.wait(null) catch unreachable;
+    }
+
+    pub const WaitError = error{
         /// The thread blocked longer than the maximum time specified.
         TimedOut,
     };
 
     /// Wait for the event to be set by blocking the current thread.
-    /// Optionally provided timeout in nanoseconds which throws an
-    /// `error.TimedOut` if the thread blocked AT LEAST longer than specified.
-    /// Returns whether or not the thread blocked from the event being unset at the time of calling.
-    pub fn wait(self: *ResetEvent, timeout_ns: ?u64) WaitError!bool {
+    /// Supports passing a hint for the maximum amount of time spent waiting.
+    /// When the thread has blocked longer than required, `WaitError.TimedOut` will be thrown.
+    pub fn timedWait(self: *ResetEvent, timeout_ns: u64) WaitError!void {
         return self.os_event.wait(timeout_ns);
     }
 };
@@ -62,12 +63,10 @@ const OsEvent = if (builtin.single_threaded) DebugEvent else switch (builtin.os)
 };
 
 const DebugEvent = struct {
-    is_set: @typeOf(set_init),
-
-    const set_init = if (std.debug.runtime_safety) false else {};
+    is_set: bool,
 
     pub fn init() DebugEvent {
-        return DebugEvent{ .is_set = set_init };
+        return DebugEvent{ .is_set = false };
     }
 
     pub fn deinit(self: *DebugEvent) void {
@@ -75,29 +74,23 @@ const DebugEvent = struct {
     }
 
     pub fn isSet(self: *DebugEvent) bool {
-        if (!std.debug.runtime_safety)
-            return true;
         return self.is_set;
     }
 
-    pub fn set(self: *DebugEvent, auto_reset: bool) bool {
-        if (std.debug.runtime_safety)
-            self.is_set = !auto_reset;
-        return false;
+    pub fn set(self: *DebugEvent) void {
+        self.is_set = true;
     }
 
-    pub fn reset(self: *DebugEvent) bool {
-        if (!std.debug.runtime_safety)
-            return false;
-        const was_set = self.is_set;
+    pub fn reset(self: *DebugEvent) void {
         self.is_set = false;
-        return was_set;
     }
 
-    pub fn wait(self: *DebugEvent, timeout: ?u64) ResetEvent.WaitError!bool {
-        if (std.debug.runtime_safety and !self.is_set)
-            @panic("deadlock detected");
-        return ResetEvent.WaitError.TimedOut;
+    pub fn wait(self: *DebugEvent, timeout: ?u64) ResetEvent.WaitError!void {
+        if (self.is_set)
+            return;
+        if (timeout != null)
+            return ResetEvent.WaitError.TimedOut;
+        @panic("deadlock detected");
     }
 };
 
@@ -120,39 +113,29 @@ fn AtomicEvent(comptime FutexImpl: type) type {
         }
 
         pub fn isSet(self: *const Self) bool {
-            const state = @atomicLoad(u32, &self.state, .Acquire);
-            return (state & IS_SET) != 0;
+            return @atomicLoad(u32, &self.state, .Acquire) == IS_SET;
         }
 
-        pub fn reset(self: *Self) bool {
-            const old_state = @atomicRmw(u32, &self.state, .Xchg, 0, .Monotonic);
-            return (old_state & IS_SET) != 0;
+        pub fn reset(self: *Self) void {
+            assert(@atomicLoad(u32, &self.state, .Monotonic) == IS_SET);
+            @atomicStore(u32, &self.state, 0, .Monotonic);
         }
 
-        pub fn set(self: *Self, auto_reset: bool) bool {
-            const new_state = if (auto_reset) 0 else IS_SET;
-            const old_state = @atomicRmw(u32, &self.state, .Xchg, new_state, .Release);
-            if ((old_state & WAIT_MASK) == 0) {
-                return false;
-            }
-
-            Futex.wake(&self.state);
-            return true;
+        pub fn set(self: *Self,) void {
+            const old_state = @atomicRmw(u32, &self.state, .Xchg, IS_SET, .Release);
+            if ((old_state & WAIT_MASK) != 0)
+                Futex.wake(&self.state);
         }
 
-        pub fn wait(self: *Self, timeout: ?u64) ResetEvent.WaitError!bool {
+        pub fn wait(self: *Self, timeout: ?u64) ResetEvent.WaitError!void {
             var dummy_value: u32 = undefined;
             const wait_token = @truncate(u32, @ptrToInt(&dummy_value));
 
             var state = @atomicLoad(u32, &self.state, .Monotonic);
-            while (true) {
-                if ((state & IS_SET) != 0)
-                    return false;
-                state = @cmpxchgWeak(u32, &self.state, state, wait_token, .Acquire, .Monotonic) orelse break;
+            while (state != IS_SET) {
+                state = @cmpxchgWeak(u32, &self.state, state, wait_token, .Acquire, .Monotonic) 
+                    orelse return Futex.wait(&self.state, wait_token, timeout);
             }
-
-            try Futex.wait(&self.state, wait_token, timeout);
-            return true;
         }
     };
 }
@@ -181,7 +164,7 @@ const LinuxEvent = AtomicEvent(struct {
         assert(linux.getErrno(rc) == 0);
     }
 
-    fn wait(ptr: *const u32, expected: u32, timeout: ?u64) ResetEvent.WaitError!void {
+    fn wait(ptr: *u32, expected: u32, timeout: ?u64) ResetEvent.WaitError!void {
         var ts: linux.timespec = undefined;
         var ts_ptr: ?*linux.timespec = null;
         if (timeout) |timeout_ns| {
@@ -208,16 +191,17 @@ const WindowsEvent = AtomicEvent(struct {
     fn wake(ptr: *const u32) void {
         if (getEventHandle()) |handle| {
             const key = @ptrCast(*const c_void, ptr);
+            // std.debug.warn("{} signalling\n", .{std.Thread.getCurrentId()});
             const rc = windows.ntdll.NtReleaseKeyedEvent(handle, key, windows.FALSE, null);
+            // std.debug.warn("{} stopped signalling with {}\n", .{std.Thread.getCurrentId(), rc});
             assert(rc == 0);
         }
     }
 
-    fn wait(ptr: *const u32, expected: u32, timeout: ?u64) ResetEvent.WaitError!void {
+    fn wait(ptr: *u32, expected: u32, timeout: ?u64) ResetEvent.WaitError!void {
         // fallback to spinlock if NT Keyed Events arent available
-        const handle = getEventHandle() orelse {
-            return SpinEvent.Futex.wait(ptr, expected, timeout);
-        };
+        const handle = getEventHandle() 
+            orelse return SpinEvent.Futex.wait(ptr, expected, timeout);
 
         // NT uses timeouts in units of 100ns with negative value being relative
         var timeout_ptr: ?*windows.LARGE_INTEGER = null;
@@ -230,10 +214,25 @@ const WindowsEvent = AtomicEvent(struct {
         // NtWaitForKeyedEvent doesnt have spurious wake-ups
         if (@atomicLoad(u32, ptr, .Acquire) == expected) {
             const key = @ptrCast(*const c_void, ptr);
-            const rc = windows.ntdll.NtWaitForKeyedEvent(handle, key, windows.FALSE, timeout_ptr);
+            // std.debug.warn("{} waiting\n", .{std.Thread.getCurrentId()});
+            var rc = windows.ntdll.NtWaitForKeyedEvent(handle, key, windows.FALSE, timeout_ptr);
+            // std.debug.warn("{} stopped waiting with {}\n", .{std.Thread.getCurrentId(), rc});
             switch (rc) {
-                0 => {},
-                windows.WAIT_TIMEOUT => return ResetEvent.WaitError.TimedOut,
+                windows.WAIT_OBJECT_0 => {},
+                windows.WAIT_FAILED => unreachable,
+                windows.WAIT_TIMEOUT => {
+                    // If we dont reset the ptr, a thread calling `wake(ptr)` will
+                    // assume that theres still a waiter and deadlock on NtReleaseKeyedEvent.
+                    // Therefor, we restore any update done to ptr and block on
+                    // NtWaitForKeyedEvent to match the corresponding NtReleaseKeyedEvent().
+                    const current_ptr = @atomicRmw(u32, ptr, .Xchg, 0, .AcqRel);
+                    if (current_ptr != expected) {
+                        @atomicStore(u32, ptr, current_ptr, .Release);
+                        rc = windows.ntdll.NtWaitForKeyedEvent(handle, key, windows.FALSE, null);
+                        assert(rc == windows.WAIT_OBJECT_0);
+                    }
+                    return ResetEvent.WaitError.TimedOut;
+                },
                 else => unreachable,
             }
         }
@@ -242,7 +241,7 @@ const WindowsEvent = AtomicEvent(struct {
     var keyed_state = State.Uninitialized;
     var keyed_handle: ?windows.HANDLE = null;
 
-    const State = enum(u8) {
+    const State = enum(u32) {
         Uninitialized,
         Intializing,
         Initialized,
@@ -291,10 +290,12 @@ const PosixEvent = struct {
 
     pub fn deinit(self: *PosixEvent) void {
         // On dragonfly, the destroy functions return EINVAL if they were initialized statically.
+        const valid_error = if (builtin.os == .dragonfly) os.EINVAL else 0;
+
         const retm = c.pthread_mutex_destroy(&self.mutex);
-        assert(retm == 0 or retm == (if (builtin.os == .dragonfly) os.EINVAL else 0));
+        assert(retm == 0 or retm == valid_error);
         const retc = c.pthread_cond_destroy(&self.cond);
-        assert(retc == 0 or retc == (if (builtin.os == .dragonfly) os.EINVAL else 0));
+        assert(retc == 0 or retc == valid_error);
     }
 
     pub fn isSet(self: *PosixEvent) bool {
@@ -304,33 +305,29 @@ const PosixEvent = struct {
         return self.state == IS_SET;
     }
 
-    pub fn reset(self: *PosixEvent) bool {
+    pub fn reset(self: *PosixEvent) void {
         assert(c.pthread_mutex_lock(&self.mutex) == 0);
         defer assert(c.pthread_mutex_unlock(&self.mutex) == 0);
 
-        const was_set = self.state == IS_SET;
         self.state = 0;
-        return was_set;
     }
 
-    pub fn set(self: *PosixEvent, auto_reset: bool) bool {
+    pub fn set(self: *PosixEvent) void {
         assert(c.pthread_mutex_lock(&self.mutex) == 0);
         defer assert(c.pthread_mutex_unlock(&self.mutex) == 0);
 
         const had_waiter = self.state > IS_SET;
-        self.state = if (auto_reset) 0 else IS_SET;
-        if (had_waiter) {
+        self.state = IS_SET;
+        if (had_waiter)
             assert(c.pthread_cond_signal(&self.cond) == 0);
-        }
-        return had_waiter;
     }
 
-    pub fn wait(self: *PosixEvent, timeout: ?u64) ResetEvent.WaitError!bool {
+    pub fn wait(self: *PosixEvent, timeout: ?u64) ResetEvent.WaitError!void {
         assert(c.pthread_mutex_lock(&self.mutex) == 0);
         defer assert(c.pthread_mutex_unlock(&self.mutex) == 0);
 
         if (self.state == IS_SET)
-            return false;
+            return;
 
         var ts: os.timespec = undefined;
         if (timeout) |timeout_ns| {
@@ -358,8 +355,7 @@ const PosixEvent = struct {
                 true => c.pthread_cond_wait(&self.cond, &self.mutex),
                 else => c.pthread_cond_timedwait(&self.cond, &self.mutex, &ts),
             };
-            // TODO: rc appears to be the positive error code making os.errno() always return 0 on linux
-            switch (std.math.max(@as(c_int, os.errno(rc)), rc)) {
+            switch (rc) {
                 0 => {},
                 os.ETIMEDOUT => return ResetEvent.WaitError.TimedOut,
                 os.EINVAL => unreachable,
@@ -367,67 +363,88 @@ const PosixEvent = struct {
                 else => unreachable,
             }
         }
-        return true;
     }
 };
 
 test "std.ResetEvent" {
-    // TODO
-    if (builtin.single_threaded)
-        return error.SkipZigTest;
-
     var event = ResetEvent.init();
     defer event.deinit();
 
     // test event setting
     testing.expect(event.isSet() == false);
-    testing.expect(event.set(false) == false);
+    event.set();
     testing.expect(event.isSet() == true);
 
     // test event resetting
-    testing.expect(event.reset() == true);
+    event.reset();
     testing.expect(event.isSet() == false);
-    testing.expect(event.reset() == false);
 
-    // test cross thread signaling
+    // test event waiting
+    testing.expectError(error.TimedOut, event.timedWait(1));
+    testing.expect(event.isSet() == false);
+    event.set();
+    try event.timedWait(1);
+
+    // test cross-thread signaling
+    if (builtin.single_threaded)
+        return;
+
     const Context = struct {
-        event: ResetEvent,
+        const Self = @This();
+        const max_wait = 1 * time.second;
+
         value: u128,
+        in: std.ResetEvent,
+        out: std.ResetEvent,
 
-        fn receiver(self: *@This()) void {
-            // wait for the sender to notify us with updated value
-            assert(self.value == 0);
-            assert((self.event.wait(1 * time.second) catch unreachable) == true);
-            assert(self.value == 1);
-
-            // wait for sender to sleep, then notify it of new value
-            time.sleep(50 * time.millisecond);
-            self.value = 2;
-            assert(self.event.set(false) == true);
+        fn init() Self {
+            return Self{
+                .value = 0,
+                .in = std.ResetEvent.init(),
+                .out = std.ResetEvent.init(),
+            };
         }
 
-        fn sender(self: *@This()) !void {
-            // wait for the receiver() to start wait()'ing
-            time.sleep(50 * time.millisecond);
+        fn deinit(self: *Self) void {
+            self.in.deinit();
+            self.out.deinit();
+            self.* = undefined;
+        }
 
-            // update value to 1 and notify the receiver()
-            assert(self.value == 0);
+        fn sender(self: *Self) !void {
+            // update value and signal input
+            testing.expect(self.value == 0);
             self.value = 1;
-            assert(self.event.set(true) == true);
+            self.in.set();
 
-            // wait for the receiver to update the value & notify us
-            assert((try self.event.wait(1 * time.second)) == true);
-            assert(self.value == 2);
+            // wait for receiver to update value and signal output
+            try self.out.timedWait(max_wait);
+            testing.expect(self.value == 2);
+            
+            // update value and signal final input
+            self.value = 3;
+            self.in.set();
+        }
+
+        fn receiver(self: *Self) void {
+            // wait for sender to update value and signal input
+            self.in.timedWait(max_wait) catch unreachable;
+            assert(self.value == 1);
+            
+            // update value and signal output
+            self.in.reset();
+            self.value = 2;
+            self.out.set();
+            
+            // wait for sender to update value and signal final input
+            self.in.timedWait(max_wait) catch unreachable;
+            assert(self.value == 3);
         }
     };
 
-    _ = event.reset();
-    var context = Context{
-        .event = event,
-        .value = 0,
-    };
-    
-    var receiver = try std.Thread.spawn(&context, Context.receiver);
+    var context = Context.init();
+    defer context.deinit();
+    const receiver = try std.Thread.spawn(&context, Context.receiver);
     defer receiver.wait();
     try context.sender();
 }
