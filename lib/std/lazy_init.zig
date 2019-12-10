@@ -3,7 +3,6 @@ const assert = std.debug.assert;
 const testing = std.testing;
 
 /// Thread-safe initialization of global data.
-/// TODO use a mutex instead of a spinlock
 pub fn lazyInit(comptime T: type) LazyInit(T) {
     return LazyInit(T){
         .data = undefined,
@@ -12,14 +11,9 @@ pub fn lazyInit(comptime T: type) LazyInit(T) {
 
 fn LazyInit(comptime T: type) type {
     return struct {
-        state: State = .NotResolved,
+        lock: std.Mutex = std.Mutex.init(),
+        is_resolved: u8 = 0,
         data: Data,
-
-        const State = enum(u8) {
-            NotResolved,
-            Resolving,
-            Resolved,
-        };
 
         const Self = @This();
 
@@ -31,29 +25,24 @@ fn LazyInit(comptime T: type) type {
         /// or returns null, indicating that the caller should
         /// perform the initialization and then call resolve().
         pub fn get(self: *Self) ?Ptr {
-            while (true) {
-                var state = @cmpxchgWeak(State, &self.state, .NotResolved, .Resolving, .SeqCst, .SeqCst) orelse return null;
-                switch (state) {
-                    .NotResolved => continue,
-                    .Resolving => {
-                        // TODO mutex instead of a spinlock
-                        continue;
-                    },
-                    .Resolved => {
-                        if (@sizeOf(T) == 0) {
-                            return @as(T, undefined);
-                        } else {
-                            return &self.data;
-                        }
-                    },
-                    else => unreachable,
-                }
+            if (@atomicLoad(u8, &self.is_resolved, .Monotonic) == 0) {
+                const held = self.lock.acquire();
+                if (self.is_resolved == 0)
+                    return null;
+                held.release();
+            }
+            
+            if (@sizeOf(T) == 0) {
+                return @as(T, undefined);
+            } else {
+                return &self.data;
             }
         }
 
         pub fn resolve(self: *Self) void {
-            const prev = @atomicRmw(State, &self.state, .Xchg, .Resolved, .SeqCst);
-            assert(prev != .Resolved); // resolve() called twice
+            const held = std.Mutex.Held{ .mutex = &self.lock };
+            @atomicStore(u8, &self.is_resolved, 1, .Monotonic);
+            held.release();
         }
     };
 }
