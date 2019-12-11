@@ -39,117 +39,99 @@ pub const Mutex = if (builtin.single_threaded)
 else
     struct {
         state: usize,
-
-        const MUTEX_LOCK: usize = 1 << 0;
-        const QUEUE_LOCK: usize = 1 << 1;
+    
+        const MUTEX_LOCK: usize = 1;
+        const QUEUE_LOCK: usize = 2;
         const QUEUE_MASK: usize = ~(MUTEX_LOCK | QUEUE_LOCK);
-        const QueueNode = std.atomic.Stack(ResetEvent).Node;
-
-        /// number of iterations to spin yielding the cpu
+    
         const SPIN_CPU = 4;
-
-        /// number of iterations to spin in the cpu yield loop
         const SPIN_CPU_COUNT = 30;
-
-        /// number of iterations to spin yielding the thread
         const SPIN_THREAD = 1;
-
+    
+        const QueueNode = struct {
+            next: ?*QueueNode,
+            event: ResetEvent,
+        };
+    
         pub fn init() Mutex {
             return Mutex{ .state = 0 };
         }
-
+    
         pub fn deinit(self: *Mutex) void {
             self.* = undefined;
         }
-
-        pub const Held = struct {
-            mutex: *Mutex,
-
-            pub fn release(self: Held) void {
-                // since MUTEX_LOCK is the first bit, we can use (.Sub) instead of (.And, ~MUTEX_LOCK).
-                // this is because .Sub may be implemented more efficiently than the latter
-                // (e.g. `lock xadd` vs `lock cmpxchg` loop on x86)
-                const state = @atomicRmw(usize, &self.mutex.state, .Sub, MUTEX_LOCK, .Release);
-                if ((state & QUEUE_MASK) != 0 and (state & QUEUE_LOCK) == 0) {
-                    self.mutex.releaseSlow(state);
-                }
-            }
-        };
-
+    
         pub fn acquire(self: *Mutex) Held {
-            // fast path close to SpinLock fast path
-            if (@cmpxchgWeak(usize, &self.state, 0, MUTEX_LOCK, .Acquire, .Monotonic)) |current_state| {
-                self.acquireSlow(current_state);
-            }
+            if (@cmpxchgWeak(usize, &self.state, 0, MUTEX_LOCK, .Acquire, .Monotonic)) |state|
+                self.acquireSlow(state);
             return Held{ .mutex = self };
         }
-
+    
         fn acquireSlow(self: *Mutex, current_state: usize) void {
-            var spin: usize = 0;
             var state = current_state;
+            var spin_count: usize = 0;
             while (true) {
-
-                // try and acquire the lock if unlocked
-                if ((state & MUTEX_LOCK) == 0) {
+    
+                if (state & MUTEX_LOCK == 0) {
                     state = @cmpxchgWeak(usize, &self.state, state, state | MUTEX_LOCK, .Acquire, .Monotonic) orelse return;
                     continue;
                 }
-
-                // spin only if the waiting queue isn't empty and when it hasn't spun too much already
-                if ((state & QUEUE_MASK) == 0 and spin < SPIN_CPU + SPIN_THREAD) {
-                    if (spin < SPIN_CPU) {
+    
+                if (state & QUEUE_MASK == 0 and spin_count < SPIN_CPU + SPIN_THREAD) {
+                    if (spin_count < SPIN_CPU) {
                         std.SpinLock.yield(SPIN_CPU_COUNT);
                     } else {
-                        std.os.sched_yield() catch std.time.sleep(10 * std.time.millisecond);
+                        std.os.sched_yield() catch std.time.sleep(1 * std.time.millisecond);
                     }
+                    spin_count += 1;
                     state = @atomicLoad(usize, &self.state, .Monotonic);
-                    spin += 1;
                     continue;
                 }
-
-                // thread should block, try and add this event to the waiting queue
+    
                 var node = QueueNode{
+                    .event = ResetEvent.init(),
                     .next = @intToPtr(?*QueueNode, state & QUEUE_MASK),
-                    .data = ResetEvent.init(),
                 };
-                defer node.data.deinit();
+                defer node.event.deinit();
                 const new_state = @ptrToInt(&node) | (state & ~QUEUE_MASK);
                 state = @cmpxchgWeak(usize, &self.state, state, new_state, .Release, .Monotonic) orelse {
-                    // node is in the queue, wait until a `held.release()` wakes us up.
-                    node.data.wait();
-                    spin = 0;
+                    node.event.wait();
+                    spin_count = 0;
                     state = @atomicLoad(usize, &self.state, .Monotonic);
                     continue;
                 };
             }
         }
-
+    
+        pub const Held = struct {
+            mutex: *Mutex,
+    
+            pub fn release(self: Held) void {
+                const state = @atomicRmw(usize, &self.mutex.state, .Sub, MUTEX_LOCK, .Release);
+                if (state & QUEUE_LOCK == 0 and state & QUEUE_MASK != 0)
+                    self.mutex.releaseSlow(state);
+            }
+        };
+    
         fn releaseSlow(self: *Mutex, current_state: usize) void {
-            // grab the QUEUE_LOCK in order to signal a waiting queue node's event.
             var state = current_state;
             while (true) {
-                if ((state & QUEUE_LOCK) != 0 or (state & QUEUE_MASK) == 0)
+                if (state & QUEUE_LOCK != 0 or state & QUEUE_MASK == 0)
                     return;
                 state = @cmpxchgWeak(usize, &self.state, state, state | QUEUE_LOCK, .Acquire, .Monotonic) orelse break;
             }
-
+    
             while (true) {
-                // barrier needed to observe incoming state changes
-                defer @fence(.Acquire);
-
-                // the mutex is currently locked. try to unset the QUEUE_LOCK and let the locker wake up the next node.
-                // avoids waking up multiple sleeping threads which try to acquire the lock again which increases contention.
-                if ((state & MUTEX_LOCK) != 0) {
+                if (state & MUTEX_LOCK != 0) {
                     state = @cmpxchgWeak(usize, &self.state, state, state & ~QUEUE_LOCK, .Release, .Monotonic) orelse return;
                     continue;
                 }
-
-                // try to pop the top node on the waiting queue stack to wake it up
-                // while at the same time unsetting the QUEUE_LOCK.
+    
                 const node = @intToPtr(*QueueNode, state & QUEUE_MASK);
-                const new_state = @ptrToInt(node.next) | (state & MUTEX_LOCK);
-                state = @cmpxchgWeak(usize, &self.state, state, new_state, .Release, .Monotonic)
-                    orelse return node.data.set();
+                state = @cmpxchgWeak(usize, &self.state, state, @ptrToInt(node.next), .Release, .Monotonic) orelse {
+                    node.event.set();
+                    return;
+                };
             }
         }
     };
