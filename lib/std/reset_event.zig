@@ -35,6 +35,13 @@ const PosixEvent = struct {
         assert(retc == 0 or retc == valid_error);
     }
 
+    pub fn isSet(self: *ResetEvent) bool {
+        assert(c.pthread_mutex_lock(&self.mutex) == 0);
+        defer assert(c.pthread_mutex_unlock(&self.mutex) == 0);
+
+        return self.is_set;
+    }
+
     pub fn reset(self: *ResetEvent) void {
         assert(c.pthread_mutex_lock(&self.mutex) == 0);
         defer assert(c.pthread_mutex_unlock(&self.mutex) == 0);
@@ -75,6 +82,10 @@ const AtomicEvent = struct {
     pub fn deinit(self: *ResetEvent) void {
         self.os_event.deinit();
         self.* = undefined;
+    }
+
+    pub fn isSet(self: *const ResetEvent) bool {
+        return @atomicLoad(i32, &self.key, .Acquire) == 2;
     }
  
     pub fn reset(self: *ResetEvent) void {
@@ -164,17 +175,37 @@ const AtomicEvent = struct {
             assert(rc == 0);
         }
  
-        var event_handle = std.lazyInit(?windows.HANDLE);
+        var event_state = State.Uninitialized;
+        var event_handle: ?windows.HANDLE = null;
  
+        const State = enum(u32) {
+            Uninitialized,
+            Initializing,
+            Initialized,
+        };
+    
         fn getEventHandle() ?windows.HANDLE {
-            if (event_handle.get()) |handle|
-                return handle.*;
-            const handle_ptr = @ptrCast(*windows.HANDLE, &event_handle.data);
-            const access_mask = windows.GENERIC_READ | windows.GENERIC_WRITE;
-            if (windows.ntdll.NtCreateKeyedEvent(handle_ptr, access_mask, null, 0) != 0)
-                event_handle.data = null;
-            event_handle.resolve();
-            return event_handle.data;
+            var spin = Backoff.init();
+            var state = @atomicLoad(State, &event_state, .Monotonic);
+            while (true) {
+                switch (state) {
+                    .Uninitialized => state = @cmpxchgWeak(State, &event_state, state, .Initializing, .Acquire, .Monotonic) orelse {
+                        const handle_ptr = @ptrCast(*windows.HANDLE, &event_handle);
+                        const access_mask = windows.GENERIC_READ | windows.GENERIC_WRITE;
+                        if (windows.ntdll.NtCreateKeyedEvent(handle_ptr, access_mask, null, 0) != 0)
+                            event_handle = null;
+                        @atomicStore(State, &event_state, .Initialized, .Release);
+                        return event_handle;
+                    },
+                    .Initializing => {
+                        spin.yield();
+                        state = @atomicLoad(State, &event_state, .Monotonic);
+                    },
+                    .Initialized => {
+                        return event_handle;
+                    },
+                }
+            }
         }
     };
 };
@@ -217,7 +248,7 @@ test "std.ResetEvent" {
             self.* = undefined;
         }
 
-        fn sender(self: *Self) !void {
+        fn sender(self: *Self) void {
             // update value and signal input
             testing.expect(self.value == 0);
             self.value = 1;
@@ -252,5 +283,5 @@ test "std.ResetEvent" {
     defer context.deinit();
     const receiver = try std.Thread.spawn(&context, Context.receiver);
     defer receiver.wait();
-    try context.sender();
+    context.sender();
 }

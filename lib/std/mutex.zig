@@ -63,13 +63,13 @@ else
     
         pub fn acquire(self: *Mutex) Held {
             if (@cmpxchgWeak(usize, &self.state, 0, MUTEX_LOCK, .Acquire, .Monotonic)) |state|
-                self.acquireSlow(state);
+                self.acquireSlow();
             return Held{ .mutex = self };
         }
     
-        fn acquireSlow(self: *Mutex, current_state: usize) void {
-            var state = current_state;
+        fn acquireSlow(self: *Mutex) void {
             var spin_count: usize = 0;
+            var state = @atomicLoad(usize, &self.state, .Monotonic);
             while (true) {
     
                 if (state & MUTEX_LOCK == 0) {
@@ -109,24 +109,26 @@ else
             pub fn release(self: Held) void {
                 const state = @atomicRmw(usize, &self.mutex.state, .Sub, MUTEX_LOCK, .Release);
                 if (state & QUEUE_LOCK == 0 and state & QUEUE_MASK != 0)
-                    self.mutex.releaseSlow(state);
+                    self.mutex.releaseSlow();
             }
         };
     
-        fn releaseSlow(self: *Mutex, current_state: usize) void {
-            var state = current_state;
+        fn releaseSlow(self: *Mutex) void {
+            var state = @atomicLoad(usize, &self.state, .Monotonic);
             while (true) {
                 if (state & QUEUE_LOCK != 0 or state & QUEUE_MASK == 0)
                     return;
                 state = @cmpxchgWeak(usize, &self.state, state, state | QUEUE_LOCK, .Acquire, .Monotonic) orelse break;
             }
-    
+
+            state = @atomicLoad(usize, &self.state, .Monotonic);
             while (true) {
                 if (state & MUTEX_LOCK != 0) {
                     state = @cmpxchgWeak(usize, &self.state, state, state & ~QUEUE_LOCK, .Release, .Monotonic) orelse return;
                     continue;
                 }
-    
+
+                @fence(.Acquire);
                 const node = @intToPtr(*QueueNode, state & QUEUE_MASK);
                 state = @cmpxchgWeak(usize, &self.state, state, @ptrToInt(node.next), .Release, .Monotonic) orelse {
                     node.event.set();
