@@ -2,947 +2,698 @@ const std = @import("../std.zig");
 const builtin = @import("builtin");
 const root = @import("root");
 const assert = std.debug.assert;
-const testing = std.testing;
-const mem = std.mem;
-const AtomicRmwOp = builtin.AtomicRmwOp;
-const AtomicOrder = builtin.AtomicOrder;
-const fs = std.event.fs;
-const os = std.os;
-const windows = os.windows;
-const maxInt = std.math.maxInt;
-const Thread = std.Thread;
+const Allocator = std.mem.Allocator;
 
+usingnamespace switch (builtin.os) {
+    .windows => @import("reactor/windows.zig"),
+    .linux => @import("reactor/linux.zig"),
+    else => @import("reactor/posix.zig"),
+};
+
+/// Parallel, work-stealing event loop implementation influenced by the golang scheduler:
+/// https://github.com/golang/go/blob/master/src/runtime/proc.go
+///
+/// Serial vs Parallel:
+///         The event loop supports both multi-threaded execution
+///     (Loop.runParallel) and single threaded execution (Loop.runSerial) when
+///     compiled with --single-threaded or when running on a uni-core processor.
+///
+/// Work-Stealing:
+///         The implementation borrows from golang where it consists of each worker,
+///     running on its own thread, using a single-producer, multi-consumer queue
+///     where it pushes and pops tasks off locally. When the local queue is empty,
+///     it checks the global queue (injector). When the global queue is empty, it
+///     tries to steal tasks from other workers in a random order to reduce contention.
+///     
+///         A worker trying to steal from others is in a "spinning" state.
+///     We limit the maximum amount of parallel spinning workers to half the amount
+///     of active workers in an attempt to reduce contention. To compensate for this,
+///     a new task which becomes runnable will try and start/resume a worker thread if
+///     it observes there are no other spinning workers since they would steal the task.
+///     Futhermore, when a spinning worker finds a runnable tasks, it starts/resumes a
+///     new spinning worker if possible; ensuring that there may be a worker to handle
+///     any incoming new work.
+///
+/// Non-Blocking IO:
+///         IO operations which have the ability to not block the thread are handled by
+///     the Reactor. Async functions which attempt to perform IO that could block are
+///     suspended until the IO action becomes ready or completes. Worker threads who
+///     run out of work will try and poll the Reactor for ready tasks to run by trying
+///     to acquire the Reactor atomically. This keeps only one worker polling on the
+///     reactor which reduces contention in the kernel's IO poller.
+///
+/// Blocking async functions:
+///         IO operations which do not support non-blocking operations
+///     (e.g. POSIX file IO on Linux) as well as long CPU intensive computations
+///     can occupy a worker thread keeping it from handling smaller, non-blocking
+///     async functions. This implementation employs a method to handle this:
+///
+///         In Parallel (multi-threaded) execution, a thread is spawned with the
+///     job of monitoring worker threads. If it observes that worker threads have
+///     been blocking on a given async function for "too long", then it steals the
+///     worker from the OS thread it belonged to and attemps to spawn a new thread
+///     to handle the workers non-blocking tasks. This means that the event loop
+///     can create more threads than there are workers if it deems necessary.
 pub const Loop = struct {
-    allocator: *mem.Allocator,
-    next_tick_queue: std.atomic.Queue(anyframe),
-    os_data: OsData,
-    final_resume_node: ResumeNode,
-    pending_event_count: usize,
-    extra_threads: []*Thread,
+    // loop state
+    lock: std.Mutex,
+    reactor: Reactor,
+    reactor_lock: u8,
+    pending_tasks: usize,
+    stop_event: std.ResetEvent,
 
-    // pre-allocated eventfds. all permanently active.
-    // this is how we send promises to be resumed on other threads.
-    available_eventfd_resume_nodes: std.atomic.Stack(ResumeNode.EventFd),
-    eventfd_resume_nodes: []std.atomic.Stack(ResumeNode.EventFd).Node,
+    // worker state
+    run_queue: Task.List,
+    workers: []Worker,
+    idle_workers: ?*Worker,
+    workers_idle: usize,
+    workers_spinning: usize,
 
-    pub const NextTickNode = std.atomic.Queue(anyframe).Node;
+    // thread state
+    max_threads: usize,
+    free_threads: usize,
+    idle_threads: ?*Thread,
+    monitor_thread: ?*Thread,
 
-    pub const ResumeNode = struct {
-        id: Id,
-        handle: anyframe,
-        overlapped: Overlapped,
+    var global_instance: Loop = undefined;
 
-        pub const overlapped_init = switch (builtin.os) {
-            .windows => windows.OVERLAPPED{
-                .Internal = 0,
-                .InternalHigh = 0,
-                .Offset = 0,
-                .OffsetHigh = 0,
-                .hEvent = null,
-            },
-            else => {},
-        };
-        pub const Overlapped = @TypeOf(overlapped_init);
-
-        pub const Id = enum {
-            Basic,
-            Stop,
-            EventFd,
-        };
-
-        pub const EventFd = switch (builtin.os) {
-            .macosx, .freebsd, .netbsd, .dragonfly => KEventFd,
-            .linux => struct {
-                base: ResumeNode,
-                epoll_op: u32,
-                eventfd: i32,
-            },
-            .windows => struct {
-                base: ResumeNode,
-                completion_key: usize,
-            },
-            else => struct {},
-        };
-
-        const KEventFd = struct {
-            base: ResumeNode,
-            kevent: os.Kevent,
-        };
-
-        pub const Basic = switch (builtin.os) {
-            .macosx, .freebsd, .netbsd, .dragonfly => KEventBasic,
-            .linux => struct {
-                base: ResumeNode,
-            },
-            .windows => struct {
-                base: ResumeNode,
-            },
-            else => @compileError("unsupported OS"),
-        };
-
-        const KEventBasic = struct {
-            base: ResumeNode,
-            kev: os.Kevent,
-        };
+    pub const instance = if (@hasDecl(root, "event_loop"))
+        root.event_loop
+    else switch (std.io.mode) {
+        .blocking => @as(?*Loop, null),
+        .evented => &global_instance,
     };
 
-    var global_instance_state: Loop = undefined;
-    const default_instance: ?*Loop = switch (std.io.mode) {
-        .blocking => null,
-        .evented => &global_instance_state,
-    };
-    pub const instance: ?*Loop = if (@hasDecl(root, "event_loop")) root.event_loop else default_instance;
-
-    /// TODO copy elision / named return values so that the threads referencing *Loop
-    /// have the correct pointer value.
-    /// https://github.com/ziglang/zig/issues/2761 and https://github.com/ziglang/zig/issues/2765
-    pub fn init(self: *Loop) !void {
+    /// Run an async function using the event loop with default settings.
+    pub fn run(self: *Loop, comptime entryFn: var, args: var) !@TypeOf(entryFn).ReturnType {
         if (builtin.single_threaded) {
-            return self.initSingleThreaded();
+            return self.runSerial(entryFn, args, .{});
         } else {
-            return self.initMultiThreaded();
+            return self.runParallel(entryFn, args, .{});
         }
     }
 
-    /// After initialization, call run().
-    /// TODO copy elision / named return values so that the threads referencing *Loop
-    /// have the correct pointer value.
-    /// https://github.com/ziglang/zig/issues/2761 and https://github.com/ziglang/zig/issues/2765
-    pub fn initSingleThreaded(self: *Loop) !void {
-        return self.initThreadPool(1);
+    /// Options for configuring the event loop for single threaded execution,
+    pub const SerialOptions = struct {
+        /// Default allocator to use for the Reactor
+        allocator: *Allocator = if (builtin.link_libc) std.heap.c_allocator else std.heap.page_allocator,
+    };
+
+    /// Run an async function using the event loop in a single threaded setting.
+    pub fn runSerial(self: *Loop, comptime entryFn: var, args: var, options: SerialOptions) !@TypeOf(entryFn).ReturnType {
+        return self.runUsing(entryFn, args, .{
+            .max_threads = 1,
+            .workers = &[_]Worker{undefined},
+            .allocator = options.allocator,
+        });
     }
 
-    /// After initialization, call run().
-    /// This is the same as `initThreadPool` using `Thread.cpuCount` to determine the thread
-    /// pool size.
-    /// TODO copy elision / named return values so that the threads referencing *Loop
-    /// have the correct pointer value.
-    /// https://github.com/ziglang/zig/issues/2761 and https://github.com/ziglang/zig/issues/2765
-    pub fn initMultiThreaded(self: *Loop) !void {
+    /// Options for configuring the event loop for multi threaded execution
+    pub const ParallelOptions = struct {
+        /// Maximum amount of parallel threads which can be running non-blocking async code
+        max_workers: ?usize = null,
+        /// Maximum amount of threads the event loop can spawn (see docs for `Loop`)
+        max_threads: ?usize = null,
+        /// Default allocator to use for allocating Worker structures and the Reactor
+        allocator: *Allocator = (SerialOptions{}).allocator,
+    };
+
+    /// Run an async function using the event loop in a multi threaded setting.
+    pub fn runParallel(self: *Loop, comptime entryFn: var, args: var, options: ParallelOptions) !@TypeOf(entryFn).ReturnType {
         if (builtin.single_threaded)
-            @compileError("initMultiThreaded unavailable when building in single-threaded mode");
-        const core_count = try Thread.cpuCount();
-        return self.initThreadPool(core_count);
-    }
+            @compileError("runParallel not supported in single-threaded mode");
 
-    /// Thread count is the total thread count. The thread pool size will be
-    /// max(thread_count - 1, 0)
-    pub fn initThreadPool(self: *Loop, thread_count: usize) !void {
-        // TODO: https://github.com/ziglang/zig/issues/3539
-        const allocator = std.heap.page_allocator;
-        self.* = Loop{
-            .pending_event_count = 1,
+        // try and default to single threaded execution if possible
+        const allocator = options.allocator;
+        const max_threads = std.math.max(1, options.max_threads orelse 10000);
+        if (max_threads == 1)
+            return self.runSerial(entryFn, args, .{ .allocator = allocator });
+
+        const max_workers = std.math.max(1, std.math.min(max_threads, options.max_workers orelse try std.Thread.cpuCount()));
+        const workers = try allocator.alloc(Worker, max_workers);
+        defer allocator.free(workers);
+
+        return self.runUsing(entryFn, args, .{
+            .max_threads = max_threads,
+            .workers = workers,
             .allocator = allocator,
-            .os_data = undefined,
-            .next_tick_queue = std.atomic.Queue(anyframe).init(),
-            .extra_threads = undefined,
-            .available_eventfd_resume_nodes = std.atomic.Stack(ResumeNode.EventFd).init(),
-            .eventfd_resume_nodes = undefined,
-            .final_resume_node = ResumeNode{
-                .id = ResumeNode.Id.Stop,
-                .handle = undefined,
-                .overlapped = ResumeNode.overlapped_init,
-            },
+        });
+    }
+
+    fn runUsing(self: *Loop, comptime entryFn: var, args: var, options: var) !@TypeOf(entryFn).ReturnType {
+        self.* = Loop{
+            .lock = std.Mutex.init(),
+            .reactor = undefined,
+            .reactor_lock = 0,
+            .pending_tasks = 0,
+            .stop_event = std.ResetEvent.init(),
+
+            .run_queue = Task.List{},
+            .workers = options.workers,
+            .idle_workers = null,
+            .workers_idle = 0,
+            .workers_spinning = 0,
+
+            .max_threads = options.max_threads,
+            .free_threads = options.free_threads,
+            .idle_threads = null,
+            .monitor_thread = null,
         };
-        // We need at least one of these in case the fs thread wants to use onNextTick
-        const extra_thread_count = thread_count - 1;
-        const resume_node_count = std.math.max(extra_thread_count, 1);
-        self.eventfd_resume_nodes = try self.allocator.alloc(
-            std.atomic.Stack(ResumeNode.EventFd).Node,
-            resume_node_count,
-        );
-        errdefer self.allocator.free(self.eventfd_resume_nodes);
 
-        self.extra_threads = try self.allocator.alloc(*Thread, extra_thread_count);
-        errdefer self.allocator.free(self.extra_threads);
+        // setup loop resources
+        defer self.lock.deinit();
+        defer self.stop_event.deinit();
+        try self.reactor.init(options.allocator);
+        defer self.reactor.deinit();
 
-        try self.initOsData(extra_thread_count);
-        errdefer self.deinitOsData();
-    }
-
-    pub fn deinit(self: *Loop) void {
-        self.deinitOsData();
-        self.allocator.free(self.extra_threads);
-    }
-
-    const InitOsDataError = os.EpollCreateError || mem.Allocator.Error || os.EventFdError ||
-        Thread.SpawnError || os.EpollCtlError || os.KEventError ||
-        windows.CreateIoCompletionPortError;
-
-    const wakeup_bytes = [_]u8{0x1} ** 8;
-
-    fn initOsData(self: *Loop, extra_thread_count: usize) InitOsDataError!void {
-        switch (builtin.os) {
-            .linux => {
-                self.os_data.fs_queue = std.atomic.Queue(fs.Request).init();
-                self.os_data.fs_queue_item = 0;
-                // we need another thread for the file system because Linux does not have an async
-                // file system I/O API.
-                self.os_data.fs_end_request = fs.RequestNode{
-                    .prev = undefined,
-                    .next = undefined,
-                    .data = fs.Request{
-                        .msg = fs.Request.Msg.End,
-                        .finish = fs.Request.Finish.NoAction,
-                    },
-                };
-
-                errdefer {
-                    while (self.available_eventfd_resume_nodes.pop()) |node| os.close(node.data.eventfd);
-                }
-                for (self.eventfd_resume_nodes) |*eventfd_node| {
-                    eventfd_node.* = std.atomic.Stack(ResumeNode.EventFd).Node{
-                        .data = ResumeNode.EventFd{
-                            .base = ResumeNode{
-                                .id = .EventFd,
-                                .handle = undefined,
-                                .overlapped = ResumeNode.overlapped_init,
-                            },
-                            .eventfd = try os.eventfd(1, os.EFD_CLOEXEC | os.EFD_NONBLOCK),
-                            .epoll_op = os.EPOLL_CTL_ADD,
-                        },
-                        .next = undefined,
-                    };
-                    self.available_eventfd_resume_nodes.push(eventfd_node);
-                }
-
-                self.os_data.epollfd = try os.epoll_create1(os.EPOLL_CLOEXEC);
-                errdefer os.close(self.os_data.epollfd);
-
-                self.os_data.final_eventfd = try os.eventfd(0, os.EFD_CLOEXEC | os.EFD_NONBLOCK);
-                errdefer os.close(self.os_data.final_eventfd);
-
-                self.os_data.final_eventfd_event = os.epoll_event{
-                    .events = os.EPOLLIN,
-                    .data = os.epoll_data{ .ptr = @ptrToInt(&self.final_resume_node) },
-                };
-                try os.epoll_ctl(
-                    self.os_data.epollfd,
-                    os.EPOLL_CTL_ADD,
-                    self.os_data.final_eventfd,
-                    &self.os_data.final_eventfd_event,
-                );
-
-                self.os_data.fs_thread = try Thread.spawn(self, posixFsRun);
-                errdefer {
-                    self.posixFsRequest(&self.os_data.fs_end_request);
-                    self.os_data.fs_thread.wait();
-                }
-
-                if (builtin.single_threaded) {
-                    assert(extra_thread_count == 0);
-                    return;
-                }
-
-                var extra_thread_index: usize = 0;
-                errdefer {
-                    // writing 8 bytes to an eventfd cannot fail
-                    os.write(self.os_data.final_eventfd, &wakeup_bytes) catch unreachable;
-                    while (extra_thread_index != 0) {
-                        extra_thread_index -= 1;
-                        self.extra_threads[extra_thread_index].wait();
-                    }
-                }
-                while (extra_thread_index < extra_thread_count) : (extra_thread_index += 1) {
-                    self.extra_threads[extra_thread_index] = try Thread.spawn(self, workerRun);
-                }
-            },
-            .macosx, .freebsd, .netbsd, .dragonfly => {
-                self.os_data.kqfd = try os.kqueue();
-                errdefer os.close(self.os_data.kqfd);
-
-                self.os_data.fs_kqfd = try os.kqueue();
-                errdefer os.close(self.os_data.fs_kqfd);
-
-                self.os_data.fs_queue = std.atomic.Queue(fs.Request).init();
-                // we need another thread for the file system because Darwin does not have an async
-                // file system I/O API.
-                self.os_data.fs_end_request = fs.RequestNode{
-                    .prev = undefined,
-                    .next = undefined,
-                    .data = fs.Request{
-                        .msg = fs.Request.Msg.End,
-                        .finish = fs.Request.Finish.NoAction,
-                    },
-                };
-
-                const empty_kevs = &[0]os.Kevent{};
-
-                for (self.eventfd_resume_nodes) |*eventfd_node, i| {
-                    eventfd_node.* = std.atomic.Stack(ResumeNode.EventFd).Node{
-                        .data = ResumeNode.EventFd{
-                            .base = ResumeNode{
-                                .id = ResumeNode.Id.EventFd,
-                                .handle = undefined,
-                                .overlapped = ResumeNode.overlapped_init,
-                            },
-                            // this one is for sending events
-                            .kevent = os.Kevent{
-                                .ident = i,
-                                .filter = os.EVFILT_USER,
-                                .flags = os.EV_CLEAR | os.EV_ADD | os.EV_DISABLE,
-                                .fflags = 0,
-                                .data = 0,
-                                .udata = @ptrToInt(&eventfd_node.data.base),
-                            },
-                        },
-                        .next = undefined,
-                    };
-                    self.available_eventfd_resume_nodes.push(eventfd_node);
-                    const kevent_array = @as(*const [1]os.Kevent, &eventfd_node.data.kevent);
-                    _ = try os.kevent(self.os_data.kqfd, kevent_array, empty_kevs, null);
-                    eventfd_node.data.kevent.flags = os.EV_CLEAR | os.EV_ENABLE;
-                    eventfd_node.data.kevent.fflags = os.NOTE_TRIGGER;
-                }
-
-                // Pre-add so that we cannot get error.SystemResources
-                // later when we try to activate it.
-                self.os_data.final_kevent = os.Kevent{
-                    .ident = extra_thread_count,
-                    .filter = os.EVFILT_USER,
-                    .flags = os.EV_ADD | os.EV_DISABLE,
-                    .fflags = 0,
-                    .data = 0,
-                    .udata = @ptrToInt(&self.final_resume_node),
-                };
-                const final_kev_arr = @as(*const [1]os.Kevent, &self.os_data.final_kevent);
-                _ = try os.kevent(self.os_data.kqfd, final_kev_arr, empty_kevs, null);
-                self.os_data.final_kevent.flags = os.EV_ENABLE;
-                self.os_data.final_kevent.fflags = os.NOTE_TRIGGER;
-
-                self.os_data.fs_kevent_wake = os.Kevent{
-                    .ident = 0,
-                    .filter = os.EVFILT_USER,
-                    .flags = os.EV_ADD | os.EV_ENABLE,
-                    .fflags = os.NOTE_TRIGGER,
-                    .data = 0,
-                    .udata = undefined,
-                };
-
-                self.os_data.fs_kevent_wait = os.Kevent{
-                    .ident = 0,
-                    .filter = os.EVFILT_USER,
-                    .flags = os.EV_ADD | os.EV_CLEAR,
-                    .fflags = 0,
-                    .data = 0,
-                    .udata = undefined,
-                };
-
-                self.os_data.fs_thread = try Thread.spawn(self, posixFsRun);
-                errdefer {
-                    self.posixFsRequest(&self.os_data.fs_end_request);
-                    self.os_data.fs_thread.wait();
-                }
-
-                if (builtin.single_threaded) {
-                    assert(extra_thread_count == 0);
-                    return;
-                }
-
-                var extra_thread_index: usize = 0;
-                errdefer {
-                    _ = os.kevent(self.os_data.kqfd, final_kev_arr, empty_kevs, null) catch unreachable;
-                    while (extra_thread_index != 0) {
-                        extra_thread_index -= 1;
-                        self.extra_threads[extra_thread_index].wait();
-                    }
-                }
-                while (extra_thread_index < extra_thread_count) : (extra_thread_index += 1) {
-                    self.extra_threads[extra_thread_index] = try Thread.spawn(self, workerRun);
-                }
-            },
-            .windows => {
-                self.os_data.io_port = try windows.CreateIoCompletionPort(
-                    windows.INVALID_HANDLE_VALUE,
-                    null,
-                    undefined,
-                    maxInt(windows.DWORD),
-                );
-                errdefer windows.CloseHandle(self.os_data.io_port);
-
-                for (self.eventfd_resume_nodes) |*eventfd_node, i| {
-                    eventfd_node.* = std.atomic.Stack(ResumeNode.EventFd).Node{
-                        .data = ResumeNode.EventFd{
-                            .base = ResumeNode{
-                                .id = ResumeNode.Id.EventFd,
-                                .handle = undefined,
-                                .overlapped = ResumeNode.overlapped_init,
-                            },
-                            // this one is for sending events
-                            .completion_key = @ptrToInt(&eventfd_node.data.base),
-                        },
-                        .next = undefined,
-                    };
-                    self.available_eventfd_resume_nodes.push(eventfd_node);
-                }
-
-                if (builtin.single_threaded) {
-                    assert(extra_thread_count == 0);
-                    return;
-                }
-
-                var extra_thread_index: usize = 0;
-                errdefer {
-                    var i: usize = 0;
-                    while (i < extra_thread_index) : (i += 1) {
-                        while (true) {
-                            const overlapped = &self.final_resume_node.overlapped;
-                            windows.PostQueuedCompletionStatus(self.os_data.io_port, undefined, undefined, overlapped) catch continue;
-                            break;
-                        }
-                    }
-                    while (extra_thread_index != 0) {
-                        extra_thread_index -= 1;
-                        self.extra_threads[extra_thread_index].wait();
-                    }
-                }
-                while (extra_thread_index < extra_thread_count) : (extra_thread_index += 1) {
-                    self.extra_threads[extra_thread_index] = try Thread.spawn(self, workerRun);
-                }
-            },
-            else => {},
+        // prepare the workers
+        for (self.workers) |*worker| {
+            worker.* = Worker.init(self);
+            self.setIdleWorker(worker);
         }
+
+        // TODO: monitor thread
+
+        // enqueue the entryFn and start a worker thread to run it
+        var result: @TypeOf(entryFn).ReturnType = undefined;
+        var frame_data: [@sizeOf(@Frame(entryFn))]u8 align(@alignOf(@Frame(entryFn))) = undefined;
+        const frame = @asyncCall(&frame_data, &result, Entry.wrapper, entryFn, args);
+        self.free_threads -= 1;
+        const main_worker = self.getIdleWorker().?;
+        Thread.run(@intToPtr(*Worker, @ptrToInt(main_worker) | 1));
+
+        // wait for the stop_event to be set and return the entryFn result
+        self.stop_event.wait();
+        return result;
     }
 
-    fn deinitOsData(self: *Loop) void {
-        switch (builtin.os) {
-            .linux => {
-                os.close(self.os_data.final_eventfd);
-                while (self.available_eventfd_resume_nodes.pop()) |node| os.close(node.data.eventfd);
-                os.close(self.os_data.epollfd);
-                self.allocator.free(self.eventfd_resume_nodes);
-            },
-            .macosx, .freebsd, .netbsd, .dragonfly => {
-                os.close(self.os_data.kqfd);
-                os.close(self.os_data.fs_kqfd);
-            },
-            .windows => {
-                windows.CloseHandle(self.os_data.io_port);
-            },
-            else => {},
-        }
-    }
-
-    /// resume_node must live longer than the anyframe that it holds a reference to.
-    /// flags must contain EPOLLET
-    pub fn linuxAddFd(self: *Loop, fd: i32, resume_node: *ResumeNode, flags: u32) !void {
-        assert(flags & os.EPOLLET == os.EPOLLET);
-        self.beginOneEvent();
-        errdefer self.finishOneEvent();
-        try self.linuxModFd(
-            fd,
-            os.EPOLL_CTL_ADD,
-            flags,
-            resume_node,
-        );
-    }
-
-    pub fn linuxModFd(self: *Loop, fd: i32, op: u32, flags: u32, resume_node: *ResumeNode) !void {
-        assert(flags & os.EPOLLET == os.EPOLLET);
-        var ev = os.linux.epoll_event{
-            .events = flags,
-            .data = os.linux.epoll_data{ .ptr = @ptrToInt(resume_node) },
-        };
-        try os.epoll_ctl(self.os_data.epollfd, op, fd, &ev);
-    }
-
-    pub fn linuxRemoveFd(self: *Loop, fd: i32) void {
-        os.epoll_ctl(self.os_data.epollfd, os.linux.EPOLL_CTL_DEL, fd, null) catch {};
-        self.finishOneEvent();
-    }
-
-    pub fn linuxWaitFd(self: *Loop, fd: i32, flags: u32) void {
-        assert(flags & os.EPOLLET == os.EPOLLET);
-        assert(flags & os.EPOLLONESHOT == os.EPOLLONESHOT);
-        var resume_node = ResumeNode.Basic{
-            .base = ResumeNode{
-                .id = .Basic,
-                .handle = @frame(),
-                .overlapped = ResumeNode.overlapped_init,
-            },
-        };
-        var need_to_delete = false;
-        defer if (need_to_delete) self.linuxRemoveFd(fd);
-
-        suspend {
-            if (self.linuxAddFd(fd, &resume_node.base, flags)) |_| {
-                need_to_delete = true;
-            } else |err| switch (err) {
-                error.FileDescriptorNotRegistered => unreachable,
-                error.OperationCausesCircularLoop => unreachable,
-                error.FileDescriptorIncompatibleWithEpoll => unreachable,
-                error.FileDescriptorAlreadyPresentInSet => unreachable, // evented writes to the same fd is not thread-safe
-
-                error.SystemResources,
-                error.UserResourceLimitReached,
-                error.Unexpected,
-                => {
-                    // Fall back to a blocking poll(). Ideally this codepath is never hit, since
-                    // epoll should be just fine. But this is better than incorrect behavior.
-                    var poll_flags: i16 = 0;
-                    if ((flags & os.EPOLLIN) != 0) poll_flags |= os.POLLIN;
-                    if ((flags & os.EPOLLOUT) != 0) poll_flags |= os.POLLOUT;
-                    var pfd = [1]os.pollfd{os.pollfd{
-                        .fd = fd,
-                        .events = poll_flags,
-                        .revents = undefined,
-                    }};
-                    _ = os.poll(&pfd, -1) catch |poll_err| switch (poll_err) {
-                        error.SystemResources,
-                        error.Unexpected,
-                        => {
-                            // Even poll() didn't work. The best we can do now is sleep for a
-                            // small duration and then hope that something changed.
-                            std.time.sleep(1 * std.time.millisecond);
-                        },
-                    };
-                    resume @frame();
-                },
+    /// Suspend the current function to allow another async function cpu time slice.
+    pub fn yield() void {
+        if (instance) |loop| {
+            suspend {
+                var task = Task.init(@frame(), .Low);
+                loop.suspended(&task);
             }
         }
     }
 
-    pub fn waitUntilFdReadable(self: *Loop, fd: os.fd_t) void {
-        return self.linuxWaitFd(fd, os.EPOLLET | os.EPOLLONESHOT | os.EPOLLIN);
-    }
-
-    pub fn waitUntilFdWritable(self: *Loop, fd: os.fd_t) void {
-        return self.linuxWaitFd(fd, os.EPOLLET | os.EPOLLONESHOT | os.EPOLLOUT);
-    }
-
-    pub fn waitUntilFdWritableOrReadable(self: *Loop, fd: os.fd_t) void {
-        return self.linuxWaitFd(fd, os.EPOLLET | os.EPOLLONESHOT | os.EPOLLOUT | os.EPOLLIN);
-    }
-
-    pub async fn bsdWaitKev(self: *Loop, ident: usize, filter: i16, fflags: u32) !os.Kevent {
-        var resume_node = ResumeNode.Basic{
-            .base = ResumeNode{
-                .id = ResumeNode.Id.Basic,
-                .handle = @frame(),
-                .overlapped = ResumeNode.overlapped_init,
-            },
-            .kev = undefined,
-        };
-        defer self.bsdRemoveKev(ident, filter);
-        suspend {
-            try self.bsdAddKev(&resume_node, ident, filter, fflags);
+    /// Should be called before an async function suspends
+    pub fn suspended(self: *Loop, task: *Task) void {
+        if (builtin.single_threaded or self.is_serial) {
+            self.pending_tasks += 1;
+        } else {
+            _ = @atomicRmw(usize, &self.pending_tasks, .Add, 1, .Monotonic);
         }
-        return resume_node.kev;
     }
 
-    /// resume_node must live longer than the anyframe that it holds a reference to.
-    pub fn bsdAddKev(self: *Loop, resume_node: *ResumeNode.Basic, ident: usize, filter: i16, fflags: u32) !void {
-        self.beginOneEvent();
-        errdefer self.finishOneEvent();
-        var kev = os.Kevent{
-            .ident = ident,
-            .filter = filter,
-            .flags = os.EV_ADD | os.EV_ENABLE | os.EV_CLEAR,
-            .fflags = fflags,
-            .data = 0,
-            .udata = @ptrToInt(&resume_node.base),
-        };
-        const kevent_array = (*const [1]os.Kevent)(&kev);
-        const empty_kevs = ([*]os.Kevent)(undefined)[0..0];
-        _ = try os.kevent(self.os_data.kqfd, kevent_array, empty_kevs, null);
-    }
-
-    pub fn bsdRemoveKev(self: *Loop, ident: usize, filter: i16) void {
-        var kev = os.Kevent{
-            .ident = ident,
-            .filter = filter,
-            .flags = os.EV_DELETE,
-            .fflags = 0,
-            .data = 0,
-            .udata = 0,
-        };
-        const kevent_array = (*const [1]os.Kevent)(&kev);
-        const empty_kevs = ([*]os.Kevent)(undefined)[0..0];
-        _ = os.kevent(self.os_data.kqfd, kevent_array, empty_kevs, null) catch undefined;
-        self.finishOneEvent();
-    }
-
-    fn dispatch(self: *Loop) void {
-        while (self.available_eventfd_resume_nodes.pop()) |resume_stack_node| {
-            const next_tick_node = self.next_tick_queue.get() orelse {
-                self.available_eventfd_resume_nodes.push(resume_stack_node);
+    /// Re-schedule and async function onto the event loop through a Task
+    pub fn resumed(self: *Loop, task: *Task) void {
+        // try and push to the local worker run queue if available.
+        // if the worker has extra tasks, try to spawn a new worker to handle it. 
+        if (!builtin.single_threaded) {
+            if (Worker.current) |worker| {
+                const has_pending_tasks = worker.hasPendingTasks();
+                worker.run_queue.push(task);
+                if (has_pending_tasks)
+                    self.spawnWorker();
                 return;
-            };
-            const eventfd_node = &resume_stack_node.data;
-            eventfd_node.base.handle = next_tick_node.data;
-            switch (builtin.os) {
-                .macosx, .freebsd, .netbsd, .dragonfly => {
-                    const kevent_array = @as(*const [1]os.Kevent, &eventfd_node.kevent);
-                    const empty_kevs = &[0]os.Kevent{};
-                    _ = os.kevent(self.os_data.kqfd, kevent_array, empty_kevs, null) catch {
-                        self.next_tick_queue.unget(next_tick_node);
-                        self.available_eventfd_resume_nodes.push(resume_stack_node);
-                        return;
-                    };
-                },
-                .linux => {
-                    // the pending count is already accounted for
-                    const epoll_events = os.EPOLLONESHOT | os.linux.EPOLLIN | os.linux.EPOLLOUT |
-                        os.linux.EPOLLET;
-                    self.linuxModFd(
-                        eventfd_node.eventfd,
-                        eventfd_node.epoll_op,
-                        epoll_events,
-                        &eventfd_node.base,
-                    ) catch {
-                        self.next_tick_queue.unget(next_tick_node);
-                        self.available_eventfd_resume_nodes.push(resume_stack_node);
-                        return;
-                    };
-                },
-                .windows => {
-                    windows.PostQueuedCompletionStatus(
-                        self.os_data.io_port,
-                        undefined,
-                        undefined,
-                        &eventfd_node.base.overlapped,
-                    ) catch {
-                        self.next_tick_queue.unget(next_tick_node);
-                        self.available_eventfd_resume_nodes.push(resume_stack_node);
-                        return;
-                    };
-                },
-                else => @compileError("unsupported OS"),
             }
         }
+
+        // no local worker run queue, push to global queue instead
+        var list = Task.PriorityList{};
+        list.push(task);
+        self.push(list);
     }
 
-    /// Bring your own linked list node. This means it can't fail.
-    pub fn onNextTick(self: *Loop, node: *NextTickNode) void {
-        self.beginOneEvent(); // finished in dispatch()
-        self.next_tick_queue.put(node);
-        self.dispatch();
+    /// Push a list of tasks to the global run queue of the event loop.
+    /// Loop.lock is assumed acquired.
+    fn push(self: *Loop, list: Task.PriorityList) void {
+        @atomicStore(usize, &self.run_queue.size, self.run_queue.size + list.size, .Monotonic);
+        self.run_queue.pushFront(list.front);
+        self.run_queue.pushBack(list.back);
     }
 
-    pub fn cancelOnNextTick(self: *Loop, node: *NextTickNode) void {
-        if (self.next_tick_queue.remove(node)) {
-            self.finishOneEvent();
-        }
+    /// Mark a worker as idle.
+    /// Loop.lock is assumed acquired.
+    fn setIdleWorker(self: *Loop, worker: *Worker) void {
+        @atomicStore(usize, &self.workers_idle, self.workers_idle + 1, .Monotonic);
+        worker.thread = null;
+        worker.next = self.idle_workers;
+        self.idle_workers = worker;
     }
 
-    pub fn run(self: *Loop) void {
-        self.finishOneEvent(); // the reference we start with
-
-        self.workerRun();
-
-        switch (builtin.os) {
-            .linux,
-            .macosx,
-            .freebsd,
-            .netbsd,
-            .dragonfly,
-            => self.os_data.fs_thread.wait(),
-            else => {},
-        }
-
-        for (self.extra_threads) |extra_thread| {
-            extra_thread.wait();
-        }
+    /// Try to get an idle worker
+    /// Loop.lock is assumed acquired.
+    fn getIdleWorker(self: *Loop) ?*Worker {
+        const worker = self.idle_workers orelse return null;
+        @atomicStore(usize, &self.workers_idle, self.workers_idle - 1, .Monotonic);
+        self.idle_workers = worker.next;
+        return worker;
     }
 
-    /// Yielding lets the event loop run, starting any unstarted async operations.
-    /// Note that async operations automatically start when a function yields for any other reason,
-    /// for example, when async I/O is performed. This function is intended to be used only when
-    /// CPU bound tasks would be waiting in the event loop but never get started because no async I/O
-    /// is performed.
-    pub fn yield(self: *Loop) void {
-        suspend {
-            var my_tick_node = NextTickNode{
-                .prev = undefined,
-                .next = undefined,
-                .data = @frame(),
-            };
-            self.onNextTick(&my_tick_node);
-        }
-    }
-
-    /// If the build is multi-threaded and there is an event loop, then it calls `yield`. Otherwise,
-    /// does nothing.
-    pub fn startCpuBoundOperation() void {
-        if (builtin.single_threaded) {
+    /// Try to spawn a new worker in the event loop
+    /// to handle incoming tasks that need processing time.
+    fn spawnWorker(self: *Loop) void {
+        // make sure theres idle workers and that arent any 
+        // spinning workers since they will handle the load.
+        if (@atomicLoad(usize, &self.workers_idle, .Monotonic) == 0)
             return;
-        } else if (instance) |event_loop| {
-            event_loop.yield();
+        if (@atomicLoad(usize, &self.workers_spinning, .Monotonic) != 0)
+            return;
+        if (@cmpxchgStrong(usize, &self.workers_spinning, 0, 1, .Acquire, .Monotonic) != null)
+            return;
+
+        // find an idle worker & try and spawn a thread with it
+        const held = self.lock.acquire();
+        defer held.release();
+        const worker = self.getIdleWorker() orelse return;
+
+        // check the free list for idle threads first
+        if (self.idle_threads) |thread| {
+            defer self.idle_threads = thread.next;
+            worker.thread = thread;
+            thread.status = .Spinning;
+            thread.worker = worker;
+            thread.event.set();
+            return;
         }
-    }
 
-    /// call finishOneEvent when done
-    pub fn beginOneEvent(self: *Loop) void {
-        _ = @atomicRmw(usize, &self.pending_event_count, AtomicRmwOp.Add, 1, AtomicOrder.SeqCst);
-    }
-
-    pub fn finishOneEvent(self: *Loop) void {
-        const prev = @atomicRmw(usize, &self.pending_event_count, AtomicRmwOp.Sub, 1, AtomicOrder.SeqCst);
-        if (prev == 1) {
-            // cause all the threads to stop
-            switch (builtin.os) {
-                .linux => {
-                    self.posixFsRequest(&self.os_data.fs_end_request);
-                    // writing 8 bytes to an eventfd cannot fail
-                    noasync os.write(self.os_data.final_eventfd, &wakeup_bytes) catch unreachable;
-                    return;
-                },
-                .macosx, .freebsd, .netbsd, .dragonfly => {
-                    self.posixFsRequest(&self.os_data.fs_end_request);
-                    const final_kevent = @as(*const [1]os.Kevent, &self.os_data.final_kevent);
-                    const empty_kevs = &[0]os.Kevent{};
-                    // cannot fail because we already added it and this just enables it
-                    _ = os.kevent(self.os_data.kqfd, final_kevent, empty_kevs, null) catch unreachable;
-                    return;
-                },
-                .windows => {
-                    var i: usize = 0;
-                    while (i < self.extra_threads.len + 1) : (i += 1) {
-                        while (true) {
-                            const overlapped = &self.final_resume_node.overlapped;
-                            windows.PostQueuedCompletionStatus(self.os_data.io_port, undefined, undefined, overlapped) catch continue;
-                            break;
-                        }
-                    }
-                    return;
-                },
-                else => @compileError("unsupported OS"),
-            }
-        }
-    }
-
-    fn workerRun(self: *Loop) void {
-        while (true) {
-            while (true) {
-                const next_tick_node = self.next_tick_queue.get() orelse break;
-                self.dispatch();
-                resume next_tick_node.data;
-                self.finishOneEvent();
-            }
-
-            switch (builtin.os) {
-                .linux => {
-                    // only process 1 event so we don't steal from other threads
-                    var events: [1]os.linux.epoll_event = undefined;
-                    const count = os.epoll_wait(self.os_data.epollfd, events[0..], -1);
-                    for (events[0..count]) |ev| {
-                        const resume_node = @intToPtr(*ResumeNode, ev.data.ptr);
-                        const handle = resume_node.handle;
-                        const resume_node_id = resume_node.id;
-                        switch (resume_node_id) {
-                            .Basic => {},
-                            .Stop => return,
-                            .EventFd => {
-                                const event_fd_node = @fieldParentPtr(ResumeNode.EventFd, "base", resume_node);
-                                event_fd_node.epoll_op = os.EPOLL_CTL_MOD;
-                                const stack_node = @fieldParentPtr(std.atomic.Stack(ResumeNode.EventFd).Node, "data", event_fd_node);
-                                self.available_eventfd_resume_nodes.push(stack_node);
-                            },
-                        }
-                        resume handle;
-                        if (resume_node_id == ResumeNode.Id.EventFd) {
-                            self.finishOneEvent();
-                        }
-                    }
-                },
-                .macosx, .freebsd, .netbsd, .dragonfly => {
-                    var eventlist: [1]os.Kevent = undefined;
-                    const empty_kevs = &[0]os.Kevent{};
-                    const count = os.kevent(self.os_data.kqfd, empty_kevs, eventlist[0..], null) catch unreachable;
-                    for (eventlist[0..count]) |ev| {
-                        const resume_node = @intToPtr(*ResumeNode, ev.udata);
-                        const handle = resume_node.handle;
-                        const resume_node_id = resume_node.id;
-                        switch (resume_node_id) {
-                            .Basic => {
-                                const basic_node = @fieldParentPtr(ResumeNode.Basic, "base", resume_node);
-                                basic_node.kev = ev;
-                            },
-                            .Stop => return,
-                            .EventFd => {
-                                const event_fd_node = @fieldParentPtr(ResumeNode.EventFd, "base", resume_node);
-                                const stack_node = @fieldParentPtr(std.atomic.Stack(ResumeNode.EventFd).Node, "data", event_fd_node);
-                                self.available_eventfd_resume_nodes.push(stack_node);
-                            },
-                        }
-                        resume handle;
-                        if (resume_node_id == ResumeNode.Id.EventFd) {
-                            self.finishOneEvent();
-                        }
-                    }
-                },
-                .windows => {
-                    var completion_key: usize = undefined;
-                    const overlapped = while (true) {
-                        var nbytes: windows.DWORD = undefined;
-                        var overlapped: ?*windows.OVERLAPPED = undefined;
-                        switch (windows.GetQueuedCompletionStatus(self.os_data.io_port, &nbytes, &completion_key, &overlapped, windows.INFINITE)) {
-                            .Aborted => return,
-                            .Normal => {},
-                            .EOF => {},
-                            .Cancelled => continue,
-                        }
-                        if (overlapped) |o| break o;
-                    } else unreachable; // TODO else unreachable should not be necessary
-                    const resume_node = @fieldParentPtr(ResumeNode, "overlapped", overlapped);
-                    const handle = resume_node.handle;
-                    const resume_node_id = resume_node.id;
-                    switch (resume_node_id) {
-                        .Basic => {},
-                        .Stop => return,
-                        .EventFd => {
-                            const event_fd_node = @fieldParentPtr(ResumeNode.EventFd, "base", resume_node);
-                            const stack_node = @fieldParentPtr(std.atomic.Stack(ResumeNode.EventFd).Node, "data", event_fd_node);
-                            self.available_eventfd_resume_nodes.push(stack_node);
-                        },
-                    }
-                    resume handle;
-                    self.finishOneEvent();
-                },
-                else => @compileError("unsupported OS"),
-            }
-        }
-    }
-
-    fn posixFsRequest(self: *Loop, request_node: *fs.RequestNode) void {
-        self.beginOneEvent(); // finished in posixFsRun after processing the msg
-        self.os_data.fs_queue.put(request_node);
-        switch (builtin.os) {
-            .macosx, .freebsd, .netbsd, .dragonfly => {
-                const fs_kevs = @as(*const [1]os.Kevent, &self.os_data.fs_kevent_wake);
-                const empty_kevs = &[0]os.Kevent{};
-                _ = os.kevent(self.os_data.fs_kqfd, fs_kevs, empty_kevs, null) catch unreachable;
-            },
-            .linux => {
-                @atomicStore(i32, &self.os_data.fs_queue_item, 1, AtomicOrder.SeqCst);
-                const rc = os.linux.futex_wake(&self.os_data.fs_queue_item, os.linux.FUTEX_WAKE, 1);
-                switch (os.linux.getErrno(rc)) {
-                    0 => {},
-                    os.EINVAL => unreachable,
-                    else => unreachable,
+        // no idle thread, try and spawn a new one.
+        // use `worker.next` as a means of communicating
+        // with the newly spawned thread to set its handle.
+        if (self.free_threads != 0) {
+            if (std.Thread.spawn(worker, Thread.run)) |handle| {
+                const encoded_handle = @ptrCast(?*Worker, handle);
+                if (@atomicRmw(?*Worker, &worker.next, .Xchg, encoded_handle, .Monotonic)) |ptr| {
+                    const decoded_thread = @ptrCast(*Thread, ptr);
+                    decoded_thread.handle = handle;
+                    decoded_thread.event.set();
                 }
-            },
-            else => @compileError("Unsupported OS"),
+                self.free_threads -= 1;
+                return;
+            } else |err| {}
         }
-    }
 
-    fn posixFsCancel(self: *Loop, request_node: *fs.RequestNode) void {
-        if (self.os_data.fs_queue.remove(request_node)) {
-            self.finishOneEvent();
-        }
+        // failed to create a worker thread.
+        // move the worker back into idle
+        // and restore the spinning count.
+        self.setIdleWorker(worker);
+        assert(@atomicRmw(usize, &self.workers_spinning, .Sub, 1, .Release) >= 1);
     }
+};
 
-    // TODO make this whole function noasync
-    // https://github.com/ziglang/zig/issues/3157
-    fn posixFsRun(self: *Loop) void {
-        while (true) {
-            if (builtin.os == .linux) {
-                @atomicStore(i32, &self.os_data.fs_queue_item, 0, .SeqCst);
-            }
-            while (self.os_data.fs_queue.get()) |node| {
-                switch (node.data.msg) {
-                    .End => return,
-                    .WriteV => |*msg| {
-                        msg.result = noasync os.writev(msg.fd, msg.iov);
-                    },
-                    .PWriteV => |*msg| {
-                        msg.result = noasync os.pwritev(msg.fd, msg.iov, msg.offset);
-                    },
-                    .PReadV => |*msg| {
-                        msg.result = noasync os.preadv(msg.fd, msg.iov, msg.offset);
-                    },
-                    .Open => |*msg| {
-                        msg.result = noasync os.openC(msg.path.ptr, msg.flags, msg.mode);
-                    },
-                    .Close => |*msg| noasync os.close(msg.fd),
-                    .WriteFile => |*msg| blk: {
-                        const O_LARGEFILE = if (@hasDecl(os, "O_LARGEFILE")) os.O_LARGEFILE else 0;
-                        const flags = O_LARGEFILE | os.O_WRONLY | os.O_CREAT |
-                            os.O_CLOEXEC | os.O_TRUNC;
-                        const fd = noasync os.openC(msg.path.ptr, flags, msg.mode) catch |err| {
-                            msg.result = err;
-                            break :blk;
-                        };
-                        defer noasync os.close(fd);
-                        msg.result = noasync os.write(fd, msg.contents);
-                    },
-                }
-                switch (node.data.finish) {
-                    .TickNode => |*tick_node| self.onNextTick(tick_node),
-                    .DeallocCloseOperation => |close_op| {
-                        self.allocator.destroy(close_op);
-                    },
-                    .NoAction => {},
-                }
-                self.finishOneEvent();
-            }
-            switch (builtin.os) {
-                .linux => {
-                    const rc = os.linux.futex_wait(&self.os_data.fs_queue_item, os.linux.FUTEX_WAIT, 0, null);
-                    switch (os.linux.getErrno(rc)) {
-                        0, os.EINTR, os.EAGAIN => continue,
-                        else => unreachable,
-                    }
-                },
-                .macosx, .freebsd, .netbsd, .dragonfly => {
-                    const fs_kevs = @as(*const [1]os.Kevent, &self.os_data.fs_kevent_wait);
-                    var out_kevs: [1]os.Kevent = undefined;
-                    _ = os.kevent(self.os_data.fs_kqfd, fs_kevs, out_kevs[0..], null) catch unreachable;
-                },
-                else => @compileError("Unsupported OS"),
-            }
-        }
-    }
+const Thread = struct {
+    threadlocal var current: ?*Thread = null;
 
-    const OsData = switch (builtin.os) {
-        .linux => LinuxOsData,
-        .macosx, .freebsd, .netbsd, .dragonfly => KEventData,
-        .windows => struct {
-            io_port: windows.HANDLE,
-            extra_thread_count: usize,
-        },
-        else => struct {},
+    next: ?*Thread,
+    state: State,
+    handle: *std.Thread,
+    worker: ?*Worker,
+    event: std.ResetEvent,
+    is_main_thread: bool,
+
+    const State = enum(u8) {
+        /// The thread does not have a worker and is possibly parked
+        Idle,
+        /// The thread is currently running async code
+        Running,
+        /// The thread is trying to acquire tasks from other threads
+        Spinning,
     };
 
-    const KEventData = struct {
-        kqfd: i32,
-        final_kevent: os.Kevent,
-        fs_kevent_wake: os.Kevent,
-        fs_kevent_wait: os.Kevent,
-        fs_thread: *Thread,
-        fs_kqfd: i32,
-        fs_queue: std.atomic.Queue(fs.Request),
-        fs_end_request: fs.RequestNode,
-    };
+    fn run(worker_ptr: *Worker) void {
+        // use the threads stack to construct the Thread itself
+        const worker = @intToPtr(*Worker, @ptrToInt(worker_ptr) & ~@as(usize, 1));
+        var self = Thread{
+            .next = null,
+            .state = if (builtin.single_threaded) .Running else .Spinning,
+            .handle = undefined,
+            .worker = worker,
+            .event = std.ResetEvent.init(),
+            .is_main_thread = @ptrToInt(worker_ptr) & 1 != 0,
+        };
+        worker.thread = &self;
+        Thread.current = &self;
+        defer self.event.deinit();
 
-    const LinuxOsData = struct {
-        epollfd: i32,
-        final_eventfd: i32,
-        final_eventfd_event: os.linux.epoll_event,
-        fs_thread: *Thread,
-        fs_queue_item: i32,
-        fs_queue: std.atomic.Queue(fs.Request),
-        fs_end_request: fs.RequestNode,
+        // communicate with the spawning thread to fetch the std.Thread handle
+        if (!builtin.single_threaded) {
+            const encoded_thread = @ptrCast(*Worker, &self);
+            const encoded_handle = @atomicRmw(?*Worker, &worker.next, .Xchg, encoded_thread, .Monotonic) orelse ptr: {
+                self.event.wait();
+                self.event.reset();
+                break :ptr worker.next.?;
+            };
+            self.handle = @ptrCast(*std.Thread, encoded_handle);
+        }
+        
+        // run the event loop
+        var tick: usize = 0;
+        const loop = worker.loop;
+        while (self.poll(loop, tick)) |task| {
+
+            // if the last thread spinning, spawn a new worker thread
+            if (!builtin.single_threaded and thread.state == .Spinning) {
+                if (@atomicRmw(usize, &loop.workers_spinning, .Sub, 1, .Release) == 1)
+                    loop.spawnWorker();
+            } 
+
+            // run the task
+            if (!builtin.single_threaded)
+                @atomicStore(State, &self.state, .Running, .Monotonic);
+            resume task.getFrame();
+            tick +%= 1;
+
+            // stop running if it was the last task
+            if (builtin.single_threaded) {
+                loop.pending_tasks -= 1;
+                if (loop.pending_tasks == 0)
+                    break;
+            } else if (@atomicRmw(usize, &loop.pending_tasks, .Sub, 1, .Monotonic) == 1) {
+                break;
+            }
+        }
+    }
+
+    fn poll(self: *Thread, loop: *Loop, tick: usize) ?*Task {
+        poll_loop: while (true) {
+            // make sure this thread can actually poll for work
+            const worker = self.worker orelse return null;
+            if (builtin.single_threaded and loop.pending_tasks == 0)
+                return null;
+            else if (@atomicLoad(usize, &loop.pending_tasks, .Monotonic) == 0)
+                return null;
+
+            // check the global queue once in a while to avoid starvation
+            if (tick % 61 == 0) {
+                if (pollGlobal(loop, worker, true, false)) |task|
+                    return task;
+            }
+
+            // check expired timer tasks
+            var wait_time: ?u64 = null;
+            if (pollTimers(worker, &wait_time)) |task|
+                return task;
+
+            // check the local queue
+            if (pollLocal(worker)) |task|
+                return task;
+
+            // check the global queue
+            if (pollGlobal(loop, worker, true, true)) |task|
+                return task;
+
+            // check the reactor (non-blocking)
+            if (pollReactor(loop, null)) |task|
+                return task; 
+
+            // check the run_queue of other workers
+            if (pollWorkers(loop, worker)) |task|
+                return task;
+
+            // wait for timers to expire if any
+            if (wait_time) |wait_time_ns| {
+                std.time.sleep(wait_time_ns + std.time.millisecond);
+                return pollTimers(workers, &wait_time).?;
+            }
+
+            // observed no work in the system, give up our worker.
+            // poll the global queue one last time if new tasks came in.
+            {
+                const held = loop.lock.acquire();
+                defer held.release();
+                if (pollGlobal(loop, worker, false, true)) |task|
+                    return task;
+                loop.setIdleWorker(worker);
+            }
+
+            // decrement spinning count
+            const was_spinning = self.state == .Spinning;
+            if (was_spinning)
+                assert(@atomicRmw(usize, &loop.workers_spinning, .Sub, 1, .Release) > 0);
+
+            // check the other worker thread run_queues again
+            // in order to try and get a new worker to process tasks.
+            for (loop.workers) |*worker| {
+                if (worker.run_queue.size() == 0)
+                    continue;
+                
+                // try to get an idle worker to process tasks
+                const held = loop.lock.acquire();
+                const idle_worker = loop.getIdleWorker();
+                held.release();
+                self.worker = idle_worker orelse break;
+                if (was_spinning) {
+                    _ = @atomicRmw(usize, &loop.workers_spinning, .Add, 1, .Acquire);
+                    self.state = .Spinning;
+                }
+                continue :poll_loop;
+            }
+
+            // check the reactor (blocking)
+            if (pollReactor(loop, &self.worker)) |task|
+                return task;
+
+            // TODO: thread parking & exitting
+        }
+    }
+
+    fn pollLocal(worker: *Worker) ?*Task {
+        // all tasks are pushed to global queue in single threaded mode
+        if (builtin.single_threaded)
+            return null;
+        return worker.run_queue.pop();
+    }
+
+    fn pollReactor(loop: *Loop, worker: ?*Worker) ?*Task {
+        // TODO
+        return null;
+    }
+
+    fn pollGlobal(loop: *Loop, worker: *Worker, comptime lock: bool, comptime grab_batch: bool) ?*Task {
+        // TODO
+        return null;
+    }
+
+    fn pollWorkers(loop: *Loop, worker: *Worker) ?*Task {
+        // TODO
+        return null;
+    }
+};
+
+const Worker = struct {
+    next: ?*Worker,
+    loop: *Loop,
+    thread: ?*Thread,
+    run_queue: LocalQueue,
+
+    fn init(loop: *Loop) Worker {
+        return Worker{
+            .next = null,
+            .loop = loop,
+            .thread = null,
+            .run_queue = LocalQueue{},
+        };
+    }
+
+    /// Single-Producer, Multi-Consumer Ring Buffer Queue
+    /// where pop(), push() should only be called by the producer thread
+    /// and size(), steal() can be called by any of the consumer threads.
+    const LocalQueue = struct {
+        head: u32,
+        tail: u32,
+        tasks: [SIZE]*Task,
+
+        const SIZE = 256;
+        const MASK = SIZE - 1;
+
+        fn size(self: *const LocalQueue) usize {
+            const tail = self.tail;
+            const head = @atomicLoad(u32, &self.head, .Acquire);
+            return tail -% head;
+        }
+
+        fn pop(self: *LocalQueue) ?*Task {
+            while (true) : (std.SpinLock.loopHint(1)) {
+                // synchronize head with stealers & return null if empty
+                const tail = self.tail;
+                const head = @atomicLoad(u32, &self.head, .Acquire);
+                if (tail -% head == 0)
+                    return null;
+
+                // try and consume the head task
+                const task = self.tasks[head & MASK];
+                if (@cmpxchgWeak(u32, &self.head, head, head +% 1, .Release, .Monotonic) == null)
+                    return task;
+            }
+        }
+
+        fn push(self: *LocalQueue, task: *Task, loop: *Loop) void {
+            return switch (task.getPriority()) {
+                .Low, .Normal => self.pushUsing(.Fifo, task, loop),
+                else => self.pushUsing(.Lifo, task, loop),
+            };
+        }
+
+        fn pushUsing(self: *LocalQueue, comptime push_type: var, task: *Task, loop: *Loop) void {
+            while (true) : (std.SpinLock.loopHint(1)) {
+                // synchronize head with stealers
+                const tail = self.tail;
+                const head = @atomicLoad(u32, &self.head, .Acquire);
+
+                // if the queue is full, overflow into the global queue
+                if (tail -% head == 0) {
+                    if (self.pushOverflow(head, task, loop))
+                        return;
+                    continue;
+                }
+
+                // the queue is not full, try and push to it
+                return switch (push_type) {
+                    .Fifo => {
+                        self.tasks[tail & MASK] = task;
+                        @atomicStore(u32, &self.tail, tail +% 1, .Release);
+                    },
+                    .Lifo => {
+                        self.tasks[(head -% 1) & MASK] = task;
+                        if (@cmpxchgWeak(u32, &self.head, head, head -% 1, .Release, .Monotonic) != null)
+                            continue;
+                    },
+                };
+            }
+        }
+
+        fn pushOverflow(self: *LocalQueue, head: u32, task: *Task, loop: *Loop) bool {
+            // try and grab half the tasks in the local queue
+            const grab = SIZE / 2;
+            if (@cmpxchgWeak(u32, &self.head, head, head +% grab, .Release, .Monotonic) != null)
+                return false;
+
+            // form a list of the acquired tasks
+            var list = Task.PriorityList{};
+            list.push(task);
+            var i: u32 = 0;
+            while (i < grab) : (i += 1) {
+                list.push(self.tasks[(head +% i) & MASK]);
+            }
+
+            // submit the list of tasks to the global queue
+            const held = loop.lock.acquire();
+            defer held.release();
+            loop.push(list);
+            return true;
+        }
+
+        fn steal(self: *LocalQueue, other: *LocalQueue) ?*Task {
+            // should only try to steal if our local queue is empty
+            const t = self.tail;
+            const h = @atomicLoad(u32, &self.head, .Monotonic);
+            assert(t -% h == 0);
+
+            while (true) : (std.SpinLock.loopHint(1)) {
+                // prepare to steal half of the tasks from the other queue.
+                // synchronize tail with other's producer & head with other's producer + stealers
+                const head = @atomicLoad(u32, &other.head, .Acquire);
+                const tail = @atomicLoad(u32, &other.tail, .Acquire);
+                const size = tail -% head;
+                var grab = size - (size / 2);
+                if (grab == 0)
+                    return null;
+
+                // store the other's tasks into our own queue
+                var i: u32 = 0;
+                while (i < grab) : (i += 1) {
+                    const task = other.tasks[(head +% i) & MASK];
+                    self.tasks[(t +% i) & MASK] = task;
+                }
+
+                // try to commit the steal
+                if (@cmpxchgWeak(u32, &other.head, head, head +% grab, .Release, .Monotonic) == null) {
+                    grab -= 1;
+                    const task = self.tasks[(t +% grab) & MASK];
+                    if (grab != 0)
+                        @atomicStore(u32, &self.tail, t +% grab, .Release);
+                    return task;
+                }
+            }
+        }
     };
 };
 
-test "std.event.Loop - basic" {
-    // https://github.com/ziglang/zig/issues/1908
-    if (builtin.single_threaded) return error.SkipZigTest;
+const Task = struct {
+    next: ?*Task,
+    frame: usize,
 
-    var loop: Loop = undefined;
-    try loop.initMultiThreaded();
-    defer loop.deinit();
+    pub const Priority = enum(u2){
+        Low,
+        Normal,
+        High,
+        Reserved,
+    };
 
-    loop.run();
-}
+    pub fn init(frame: anyframe, comptime priority: Priority) Task {
+        return Task{
+            .next = null,
+            .frame = @ptrToInt(frame) | @enumToInt(priority),
+        };
+    }
 
-async fn testEventLoop() i32 {
-    return 1234;
-}
+    pub fn getFrame(self: Task) anyframe {
+        return @intToPtr(anyframe, self.frame & ~@as(usize, ~@as(@TagType(Priority), 0)));
+    }
 
-async fn testEventLoop2(h: anyframe->i32, did_it: *bool) void {
-    const value = await h;
-    testing.expect(value == 1234);
-    did_it.* = true;
-}
+    pub fn getPriority(self: Task) Priority {
+        return @intToEnum(Priority, @truncate(@TagType(Priority), self.frame));
+    }
+
+    pub const List = struct {
+        head: ?*Task = null,
+        tail: ?*Task = null,
+        size: usize = 0,
+
+        pub fn pushBack(self: *List, list: List) void {
+            if (self.tail) |tail|
+                tail.next = list.head;
+            if (self.head == null)
+                self.head = list.head;
+            self.tail = list.tail;
+        }
+
+        pub fn pushFront(self: *List, list: List) void {
+            if (list.tail) |tail|
+                tail.next = self.head;
+            if (self.tail == null)
+                self.tail = list.tail;
+            self.head = list.head;
+        }
+    };
+
+    pub const PriorityList = struct {
+        back: List = List{},
+        front: List = List{},
+
+        pub fn size(self: PriorityList) usize {
+            return self.back.size + self.front.size;
+        }
+
+        pub fn push(self: *PriorityList, task: *Task) void {
+            task.next = null;
+            const list = List{
+                .head = task,
+                .tail = task,
+                .size = 1,
+            };
+            switch (task.getPriority()) {
+                .Low, .Normal => {
+                    self.back.pushBack(list);
+                    self.back.size += 1;
+                },
+                else => {
+                    self.front.pushBack(list);
+                    self.front.size += 1;
+                },
+            }
+        }
+    };
+};
