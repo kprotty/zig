@@ -18,6 +18,35 @@ const AtomicBitOp = enum {
     Toggle,
 };
 
+pub fn supports(comptime Int: type) bool {
+    if (std.meta.activeTag(@typeInfo(Int)) != .Int) {
+        return false;
+    }
+
+    if (!std.math.isPowerOfTwo(std.meta.bitCount(Int))) {
+        return false;
+    }
+
+    if (@sizeOf(Int) > @sizeOf(usize)) {
+        const is_x86 = std.builtin.arch == .i386 or .arch == .x86_64;
+        if (!(is_x86 and @sizeOf(Int) == @sizeOf(usize) * 2)) {
+            return false;
+        }
+    }
+
+    // TODO: return false for some ARM platforms
+
+    return true;
+}
+
+test "supports" {
+    // TODO: more robust test cases
+    switch (std.builtin.arch) {
+        .i386, .x86_64, .arm, .aarch64 => testing.expect(supports(usize)),
+        else => {},
+    }
+}
+
 pub fn spinLoopHint() void {
     switch (builtin.arch) {
         .i386, .x86_64 => asm volatile ("pause"
