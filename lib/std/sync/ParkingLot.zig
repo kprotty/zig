@@ -9,92 +9,191 @@ const atomic = @import("./atomic.zig");
 
 pub fn ParkingLot(comptime config: anytype) type {
     return struct {
-        fn hasConfig(comptime field: []const u8) bool {
-            return @hasDecl(@TypeOf(config), field);
+        fn isConfigOptional(comptime field: []const u8) bool {
+            return std.meta.activeTag(@typeInfo(@field(config, field))) == .Optional;
         }
 
-        pub const Event: type = switch (hasConfig("Event")) {
-            true => config.Event,
+        fn hasConfig(comptime field: []const u8) bool {
+            if (!@hasDecl(@TypeOf(config), field)) {
+                return false;
+            } else if (isConfigOptional(field) and @field(config, field) == null) {
+                return false;
+            } else {
+                return true;
+            }
+        }
+
+        fn getConfig(comptime field: []const u8) getConfigType(field) {
+            const value = @field(config, field);
+            if (isConfigOptional(field)) {
+                return value orelse unreachable;
+            } else {
+                return value;
+            }
+        }
+
+        fn getConfigType(comptime field: []const u8) type {
+            const FieldType = @TypeOf(@field(config, field));
+            return switch (@typeInfo(FieldType)) {
+                .Optional => |info| info.child,
+                else => FieldType,
+            };
+        }
+
+        // TODO: Document
+        pub const Event = WaitEvent;
+        const WaitEvent: type = switch (hasConfig("Event")) {
+            true => getConfig("Event"),
             else => DefaultEvent,
         };
 
-        pub const Lock: type = switch (hasConfig("Lock")) {
-            true => config.Lock,
+        // TODO: Document
+        pub const Lock = WaitLock;
+        const WaitLock: type = switch (hasConfig("Lock")) {
+            true => getConfig("Lock"),
             else => DefeaultLock(Event),
         };
 
-        pub const Timestamp: type = switch (hasConfig("Timestamp")) {
-            true => config.Timestamp,
+        // TODO: Document
+        pub const Timestamp = FairTimestamp;
+        const FairTimestamp: type = switch (hasConfig("Timestamp")) {
+            true => getConfig("Timestamp"),
             else => DefaultTimestamp,
         };
 
-        pub const bucket_count: usize = switch (hasConfig("bucket_count")) {
-            true => config.bucket_count,
+        // TODO: Document
+        pub const bucket_count = wait_bucket_count;
+        const wait_bucket_count: usize = switch (hasConfig("bucket_count")) {
+            true => getConfig("bucket_count"),
             else => DEFAULT_BUCKET_COUNT,
         };
 
+        // TODO: Document
         pub const Token = usize;
 
-        pub const FilterOp = union(enum) {
+        // TODO: Document
+        pub const Waiter = struct {
+            _token: Token,
+            _has_more: bool,
+            _bucket: *WaitBucket,
+
+            // TODO: Document
+            pub fn getToken(self: Waiter) Token {
+                return self._token;
+            }
+
+            // TODO: Document
+            pub fn hasMore(self: Waiter) bool {
+                return self._has_more;
+            }
+
+            // TODO: Document
+            pub fn didTimestampExpire(self: Waiter) bool {
+                return self._bucket.didTimestampExpire();
+            }
+        };
+
+        // TODO: Document
+        pub const Filtered = union(enum) {
             Stop,
             Skip,
             Unpark: Token,
         };
 
-        pub const RequeueOp = enum {
-            UnparkOne,
-            RequeueOne,
-            UnparkOneRequeueRest,
-            RequeueAll,
+        // TODO: Document
+        pub const Requeued = struct {
+            unpark: usize = 0,
+            requeue: usize = 0,
         };
 
+        // TODO: Document
         pub const Unparked = struct {
-            token: ?Token,
-            has_more: bool,
-            timestamp_expired: bool,
+            token: ?Token = null,
+            has_more: bool = false,
+            timestamp_expired: bool = false,
         };
 
+        // TODO: Document
         pub fn park(
             address: usize,
-            cancellation: ?Event.Cancellation,
+            cancellation: ?WaitEvent.Cancellation,
             callback: anytype, 
         ) error{Invalidated, Cancelled}!Token {
             var node: WaitNode = undefined;
-            const bucket = WaitBucket.from(address);
-
+            
             {
-                var held: Lock.Held = undefined;
-                bucket.lock.acquire(&held);
-                defer bucket.lock.release(&held);
+                // Then grab the WaitBucket lock for this address in order to 
+                // prepare for an enqueue & synchronize with unpark()
+                var held: WaitLock.Held = undefined;
+                const bucket = WaitBucket.from(address);
+                bucket.acquire(&held);
+                defer bucket.release(&held);
 
+                // Update the wait count for the bucket before calling the onValidate() function below.
+                // If done after, then an unpark() thread could see waiters = 0, 
+                // after we validate the wait but before enqueue to wait,
+                // causing this waiter to miss an unpark() notification.
                 _ = atomic.fetchAdd(&bucket.waiters, 1, .SeqCst);
 
-                const park_token: ?Token = callback.onValidate();
-                node.token = park_token orelse {
+                // Call the `onValidate()` callback which double checks that the caller should actually wait.
+                // If it returns null, then it should not wait so it reverts any changes made so far in preparation.
+                // If it returns a Token, the Token is used for the duration of the wait to tag the Waiter for the unpark() threads.
+                node.token = callback.onValidate() orelse {
                     _ = atomic.fetchSub(&bucket.waiters, 1, .SeqCst);
                     return error.Invalidated;
                 };
 
+                // Prepare our WaitNode to wait by enqueuing it and initializing any extra state.
+                var queue = bucket.queue(address);
+                const had_more = !queue.isEmpty();
+                queue.push(&node);
                 node.event.init();
-                bucket.queue(address).insert(&node);
-                callback.onBeforeWait();
             }
 
+            // Now that our WaitNode is enqueued, wait on its event.
+            // `onBeforeWait()` is called just before to do any pre-park work.
             var cancelled = false;
+            callback.onBeforeWait();
             node.event.wait(cancellation) catch {
                 cancelled = true;
             };
 
+            // If our wait was cancelled, we need to remove our Wait
             if (cancelled) {
                 {
-                    bucket.lock.acquire(&held);
-                    defer bucket.lock.release(&held);
+                    var addr: usize = undefined;
+                    var held: WaitLock.Held = undefined;
+                    var bucket: *WaitBucket = undefined;
+                    defer bucket.release(&held);
 
-                    cancelled = bucket.contains(&node);
+                    // Find the WaitBucket for our WaitNode and acquire its lock.
+                    // We keep retrying if our node address changes due to a requeue.
+                    //
+                    // Our node address can only change while the bucket is locked so
+                    // the loop will eventually terminate as long as we dont keep losing
+                    // the lock race and keep getting requeued.
+                    while (true) {
+                        addr = atomic.load(&node.address, .Relaxed);
+                        bucket = WaitBucket.from(addr);
+                        bucket.acquire(&held);
+                        if (node.address == addr) {
+                            break;
+                        } else {
+                            bucket.release(&held);
+                        }
+                    }
+
+                    // Once we find our WaitBucket, try to remove our WaitNode from its WaitQueue.
+                    // If we succeed in doing so, invoke the `onCancel()` callback with the state of the WaitQueue.
+                    //
+                    // This can fail if another thread manages to dequeue us before we get here.
+                    // If so, we need to make sure that thread no longer has a reference to our WaitNode before we return.
+                    cancelled = WaitNode.isEnqueued(&node);
                     if (cancelled) {
                         _ = atomic.fetchSub(&bucket.waiters, 1, .SeqCst);
-                        var queue = bucket.queue(address);
+                        var queue = bucket.queue(addr);
                         queue.remove(&node);
+                        
                         callback.onCancel(Unparked{
                             .token = node.token,
                             .has_more = !queue.isEmpty(),
@@ -103,6 +202,11 @@ pub fn ParkingLot(comptime config: anytype) type {
                     }
                 }
 
+                // If we failed to cancel and remove our WaitNode from the WaitQueue,
+                // it means that another thread dequeued us and is in the process of waking us up.
+                //
+                // Wait for that thread to wake up our WaitNode by setting its event
+                // to make sure that it no longer has any reference to our WaitNode before we return.
                 if (!cancelled) {
                     node.event.wait(null) catch unreachable;
                 }
@@ -112,51 +216,193 @@ pub fn ParkingLot(comptime config: anytype) type {
             return if (cancelled) error.Cancelled else node.token;
         }
 
-        pub fn unparkRequeue(
+        /// Unparks/wakes-up all waiters waiting on the wait queue for `address` using the given `Token`.
+        pub fn unparkAll(
             address: usize,
-            requeue: usize,
+            token: Token,
+        ) void {
+            const FilterCallback = struct {
+                unpark_token: Token,
+
+                pub fn onFilter(self: @This(), waiter: Waiter) Filtered {
+                    return .{ .Unpark = self.unpark_token };
+                }
+
+                pub fn onBeforeWake(self: @This()) void {
+                    // no-op
+                }
+            };
+
+            const filter_callback = FilterCallback{ .unpark_token = token };
+            unparkFilter(address, filter_callback);
+        }
+
+        /// Unparks/wakes-up one waiter waiting on the wait queue for `address`.
+        ///
+        /// While the lock for the wait queue on `address` is held, `callback.onUnpark` is called with an instance of `Unparked`.
+        /// The result of the onUnpark() function is a `Token` which is used to unpark/wake-up the corresponding waiter if any.
+        /// In regards to the values of `Unparked`:
+        ///     - token: ?Token => null if no waiter was found, otherwise its the `Token` of a parked waiter.
+        ///     - has_more: bool => true if theres more waiters in the wait queue after the dequeue of this waiter if any.
+        ///     - timestamp_expired: bool => true if the internal timestamp for the WaitQueue ticked
+        pub fn unparkOne(
+            address: usize,
             callback: anytype,
         ) void {
-            var unparked = List{};
+            const Callback = @TypeOf(callback);
+            const FilterCallback = struct {
+                callback: Callback,
+                called_unparked: bool = false,
+                
+                pub fn onFilter(self: *@This(), waiter: Waiter) Filtered {
+                    if (self.called_unparked) {
+                        return .Stop;
+                    }
+
+                    const unpark_token: Token = self.callback.onUnpark(Unparked{
+                        .token = waiter.getToken(),
+                        .has_more = waiter.hasMore(),
+                        .timestamp_expired = waiter.didTimestampExpire(),
+                    });
+
+                    self.called_unparked = true;
+                    return .{ .Unpark = unpark_token };
+                }
+
+                pub fn onBeforeWake(self: @This()) void {
+                    if (self.called_unparked) {
+                        _ = self.callback.onUnpark(Unparked{});
+                    }
+                }
+            };
+            
+            var filter_callback = FilterCallback{ .callback = callback };
+            unparkFilter(address, &filter_callback);
+        }
+
+        /// Iterate the wait queue for `address` and selectively unpark/wake-up specific waiters.
+        ///
+        /// For each waiter in the wait queue while holding its lock, it creates a `Waiter` instance
+        /// which can be used to get various information about the WaitQueue as well as the waiter's Token.
+        /// This `Waiter` instance is used to call `callback.onFilter` which returns a `FilterOp` which decides whether to:
+        ///     - FilterOp.Stop: stop scaning the wait queue and finish up any other operations.
+        ///     - FilterOp.Skip: leave the waiter represented by the `Waiter` instance in the wait queue.
+        ///     - FilterOp.Unpark(Token): dequeue and eventually unpark/wakeup the waiter represented by the `Waiter` instance.
+        ///
+        /// Once the scanning of the wait queue is completed or preempted early via FilterOp.Stop,
+        /// `callback.onBeforeWake()` is called while holding the wait queue lock to run anything post-filters.
+        pub fn unparkFilter(
+            address: usize,
+            callback: anytype,
+        ) void {
+            // Set the event for all the WaitNodes that we unpark.
+            // This is done after any WaitBucket locks are dropped.
+            var unparked = WaitList{};
             defer while (unparked.pop()) |node| {
                 node.event.set();
             };
 
+            // Find the bucket for this address and bail if it has no waiters.
             const bucket = WaitBucket.from(address);
             if (atomic.load(&bucket.waiters, .SeqCst) == 0) {
                 return;
             }
 
-            var held: Lock.Held = undefined;
-            bucket.lock.acquire(&held);
-            defer bucket.lock.release(&held);
+            // If waiters are discovered, grab the bucket lock in order to dequeue and wake them.
+            var held: WaitLock.Held = undefined;
+            bucket.acquire(&held);
+            defer bucket.release(&held);
 
-            var requeue_held: Lock.Held = undefined;
+            // Iterate the WaitNodes on this address' WaitQueue and apply the filter operations.
+            var queue = bucket.queue(address);
+            var iter = queue.iter();
+            while (iter.next()) |node| {
+                const filter_op: Filtered = callback.onFilter(Waiter{
+                    ._token = node.token,
+                    ._has_more = !iter.isEmpty(),
+                    ._bucket = bucket,
+                });
+
+                switch (filter_op) {
+                    .Stop => break,
+                    .Skip => continue,
+                    .Unpark => |unpark_token| {
+                        node.token = unpark_token;
+                        unparked.push(node);
+                    },
+                }
+            }
+
+            // If any we're unparked, update the waiter count to reflect this.
+            if (unparked.len > 0) {
+                _ = atomic.fetchSub(&bucket.waiters, unparked.len, .SeqCst);
+            }
+
+            // Before we wake up the waiters, 
+            // call the `onBeforeWake()` callback with the WaitBucket locked.
+            callback.onBeforeWake();
+        }
+
+        /// Unpark waiters waiting on `address` and move some of the others to wait on `requeue_address`.
+        ///
+        /// Once the locks for the wait queues of both `address` and `requeue_address` are held, `callback.onRequeue()` is called.
+        /// This returns a `?Requeued` instance where null implies that the entire operation should be aborted.
+        /// If not aborted:
+        ///     - `Requeued.unpark` represents the maximum amount of waiters to unpark from `address` to `requeue_address`
+        ///     - `Requeued.requeue` represents the maximum amount of waiters to move waiting on `address` to `requeue_address`.
+        ///
+        /// Once all the desired waiters are unparked/requeued, `callback.onBeforeWake` is called with both wait queue locks held.
+        /// It is given a `Requeued` instance where the `.unpark` and `.requeue` fields represent the amount of waiters that were actually moved around.
+        pub fn unparkRequeue(
+            address: usize,
+            requeue_address: usize,
+            callback: anytype,
+        ) void {
+            // Set the event for all the WaitNodes that we unpark.
+            // This is done after any WaitBucket locks are dropped.
+            var unparked = WaitList{};
+            defer while (unparked.pop()) |node| {
+                node.event.set();
+            };
+
+            // Find the bucket for the address and bail if there's nothing to unpark/requeue.
+            const bucket = WaitBucket.from(address);
+            if (atomic.load(&bucket.waiters, .SeqCst) == 0) {
+                return;
+            }
+
+            // Acquire the bucket lock for the main address.
+            var held: WaitLock.Held = undefined;
+            bucket.acquire(&held);
+            defer bucket.release(&held);
+
+            // Find the bucket for the requeue address and acquire its lock.
+            // If the address and requeue_address map to the same bucket,
+            // we don't acquire its lock as its the same above and would be UB/deadlock.
+            var requeue_held: WaitLock.Held = undefined;
             const requeue_bucket = WaitBucket.from(requeue_address);
             if (bucket != requeue_bucket) {
-                requeue_bucket.lock.acquire(&requeue_held);
+                requeue_bucket.acquire(&requeue_held);
             }
             defer if (bucket != requeue_bucket) {
-                requeue_bucket.lock.release(&requeue_held);
+                requeue_bucket.release(&requeue_held);
             };
 
-            const requeue_op: RequeueOp = callback.onRequeue();
-            var max_unpark = switch (requeue_op) {
-                .UnparkOne, .UnparkOneRequeueRest => 1,
-                .RequeueOne, .RequeueAll => 0,
-            };
-            var max_requeue = switch (requeue_op) {
-                .UnparkOne => 0,
-                .RequeueOne => 1,
-                .RequeueAll, .UnparkOneRequeueRest => std.math.maxInt(usize),
-            };
+            // With both locks held, run the requeue callback
+            // and see how many WaitNodes its requested to unpark and requeue.
+            // If `onRequeue()` returns null, then bail out of trying to requeue anything
+            const requeue_op: Requeued = callback.onRequeue() orelse return;
+            var max_requeue = requeue_op.requeue;
+            var max_unpark = requeue_op.unpark;
             
+            // Push the amount of unparked WaitNodes into the unparked WaitList.
             var queue = bucket.queue(address);
             while (max_unpark > 0) : (max_unpark -= 1) {
                 const node = queue.pop() orelse break;
                 unparked.push(node);
             }
 
+            // Push remaining WaitNodes from the queue into the requeue_queue.
             var requeued: usize = 0;
             if (max_requeue > 0) {
                 if (queue.pop()) |starting_node| {
@@ -171,81 +417,338 @@ pub fn ParkingLot(comptime config: anytype) type {
                 }
             }
 
-            callback.onBeforeWake()
-
+            // Update the waiter counts for the buckets are moving WaitNodes around.
+            // If the address and requeue_address point to the same bucket,
+            // we only need to subtract those which were unparked as the requeued are still waiting.
             if (bucket != requeue_bucket and requeued > 0) {
                 _ = atomic.fetchSub(&bucket.waiters, unparked.len + requeued, .SeqCst);
                 _ = atomic.fetchAdd(&requeue_bucket.waiters, requeued, .SeqCst);
             } else if (unparked.len > 0) {
                 _ = atomic.fetchSub(&bucket.waiters, unparked.len, .SeqCst);
             }
+
+            // After performing the unpark/requeued,
+            // invoke the onBeforeWake() while the locks are held
+            // passing in how many WaitNodes were actually unparked and requeued.
+            callback.onBeforeWake(Requeued{
+                .unpark = unparked.len,
+                .requeue = requeued,
+            });
         }
 
-        pub fn unparkFilter(
+        const WaitNode = struct {
             address: usize,
-            callback: anytype,
-        ) void {
-            @compileError("TODO");
-        }
+            prev: ?*WaitNode,
+            next: ?*WaitNode,
+            tail: *WaitNode,
+            ticket: usize,
+            parent: ?*WaitNode,
+            children: [2]?*WaitNode,
+            xorshift: u16,
+            event: WaitEvent,
+        };
 
-        pub fn unparkOne(
+        const WaitList = struct {
+            head: ?*WaitNode = null,
+            tail: ?*WaitNode = null,
+            len: usize = 0,
+
+            pub fn push(self: *WaitList, node: *WaitNode) void {
+                if (self.head == null) self.head = node;
+                if (self.tail) |tail| tail.next = node;
+                self.tail = node;
+                self.len += 1;
+                node.next = null;
+            }
+
+            pub fn pop(self: *WaitList) ?*WaitNode {
+                const node = self.head orelse return null;
+                if (node.next == null) self.tail = null;
+                self.head = node.next;
+                self.len -= 1;
+                return node;
+            }
+        };
+
+        const WaitQueue = struct {
+            bucket: *Bucket,
             address: usize,
-            callback: anytype,
-        ) void {
-            const Callback = @TypeOf(callback);
-            const FilterCallback = struct {
-                callback: Callback,
-                called_unparked: bool = false,
-                
-                pub fn onFilter(self: *@This(), waiter: Waiter) FilterOp {
-                    if (self.called_unparked) {
-                        return .Stop;
-                    }
+            parent: ?*WaitNode,
+            head: ?*WaitNode,
 
-                    const unpark_token: Token = self.callback.onUnparked(Unparked{
-                        .token = waiter.getToken(),
-                        .has_more = waiter.hasMore(),
-                        .timestamp_expired = waiter.didTimestampExpire(),
-                    });
+            pub fn iter(self: *WaitQueue) Iter {
+                return Iter{ .node = self.head };
+            }
 
-                    self.called_unparked = true;
-                    return .{ .Unpark = unpark_token };
+            const Iter = struct {
+                node: ?*WaitNode,
+
+                pub fn isEmpty(self: Iter) bool {
+                    return self.node == null;
                 }
 
-                pub fn onBeforeWake(self: @This()) void {
-                    if (self.called_unparked) {
-                        const unpark_token: Token = self.callback.onUnparked(Unparked{
-                            .token = null,
-                            .has_more = false,
-                            .timestamp_expired = false,
+                pub fn next(self: *Iter) ?*WaitNode {
+                    const node = self.node orelse return null;
+                    self.node = node.next;
+                    return node;
+                }
+            };
+
+            pub fn isEmpty(self: *WaitQueue) bool {
+                return self.head == null;
+            }
+
+            pub fn isEnqueued(node: *WaitNode) bool {
+                return node.ticket != 0;
+            }
+
+            pub fn push(self: *WaitQueue, node: *WaitNode) void {
+                // generic parts that the WaitNode will have set when inserted
+                node.next = null;
+                atomic.store(&node.address, self.address, .Relaxed);
+
+                // If theres already a list going on, append to the end of it
+                if (self.head) |head| {
+                    node.ticket = 1;
+                    node.prev = head.tail;
+                    head.tail.next = node;
+                    head.tail = node;
+                    return;
+                }
+
+                // If not, we need to create a new tree node.
+                // The new node gets a random (non-zero) ticket for rebalancing.
+                node.prev = null;
+                node.tail = node;
+                node.parent = self.parent;
+                node.children = [_]?*WaitNode{null, null};
+                node.ticket = self.bucket.genPrng(u16) | 1;
+
+                // Insert the node into the tree and re-balance it by ticket.
+                self.head = node;
+                self.updateParent(node, node);
+                while (node.parent) |parent| {
+                    if (parent.ticket <= node.ticket) break;
+                    self.rotate(parent, parent.children[0] != node);
+                }
+            }
+
+            pub fn pop(self: *WaitQueue) ?*WaitNode {
+                const node = self.head orelse return null;
+                self.remove(node);
+                return node;
+            }
+
+            pub fn remove(self: *WaitQueue, node: *WaitNode) void {
+                // Make sure the node is queued when removing.
+                // After we remove it, mark it as such.
+                assert(isEnqueued(node));
+                defer node.ticket = 0;
+
+                if (node.prev) |prev| prev.next = node.next;
+                if (node.next) |next| next.prev = node.prev;
+
+                const head = self.head orelse unreachable;
+                if (node != head) {
+                    if (node == head.tail) head.tail = node.prev.?;
+                    return;
+                }
+
+                // If we're the head and theres more nodes, we need to update the head.
+                // If we're the head and we're the last node, we need to remove ourselves from the tree.
+                if (node.next) |new_head| {
+                    new_head.ticket = head.ticket;
+                    new_head.parent = head.parent;
+                    new_head.children = head.children;
+                    for (head.children) |child_ptr| {
+                        const child = child_ptr orelse continue;
+                        child.parent = new_head;
+                    }
+                } else {
+                    // Rotate ourselves down the tree for removal.
+                    while ((head.children[0] orelse head.children[1]) != null) {
+                        self.rotate(head, is_left: {
+                            const right = head.children[1] orelse break :is_left false;
+                            const left = head.children[0] orelse break :is_left true;
+                            break :is_left (left.ticket >= right.ticket);
                         });
                     }
                 }
-            };
+
+                self.head = node.next;
+                self.updateParent(node, node.next);
+            }
+
+            /// Update the parent of the `node` to point to `new_node`.
+            /// `new_node` may alias with `node` (e.g. for insertion).
+            fn updateParent(self: *WaitQueue, node: *WaitNode, new_node: ?*WaitNode) void {
+                if (node.parent) |parent| {
+                    const parent_addr = parent.address;
+                    parent.children[@boolToInt(parent_addr > self.address)] = new_node;
+                } else {
+                    self.bucket.setRoot(new_node);
+                }
+            }
+
+            /// Rotate the given node in the tree either left or right depending on `left_rotate`.
+            fn rotate(self: *WaitQueue, node: *WaitNode, left_rotate: bool) void {
+                const swap_with = node.children[@boolToInt(left_rotate)] orelse unreachable;
+                const child = swap_with.children[@boolToInt(!left_rotate)];
+                const parent = node.parent;
+
+                swap_with.children[@boolToInt(!left_rotate)] = node;
+                node.parent = swap_with;
+                node.children[@boolToInt(left_rotate)] = child;
+                if (child) |child_node| {
+                    child_node.parent = node;
+                }
+
+                swap_with.parent = parent;
+                if (parent) |parent_node| {
+                    if (parent_node.children[0] == node) {
+                        parent_node.children[0] = swap_with;
+                    } else if (parent_node.children[1] == node) {
+                        parent_node.children[1] = swap_with;
+                    } else {
+                        unreachable;
+                    }
+                } else {
+                    self.bucket.setRoot(swap_with);
+                }
+            }
+        };
+
+        /// A WaitBucket is a synchronized collection of WaitQueues.
+        /// Each address maps to a given WaitBucket where it can enqueue itself to Wait.
+        const WaitBucket = struct {
+            lock: WaitLock = WaitLock{},
+            waiters: usize = 0,
+            root: usize = 0,
+            timestamp: FairTimestamp = FairTimestamp{},
             
-            var filter_callback = FilterCallback{ .callback = callback };
-            unparkFilter(address, &filter_callback);
-        }
+            const IS_ROOT_PRNG: usize = 0b01;
+            const IS_BUCKET_LOCKED: usize = 0b10;
+            const ROOT_NODE_MASK = ~@as(usize, IS_ROOT_PRNG | IS_BUCKET_LOCKED);
+            const PRNG_SHIFT = @popCount(std.math.Log2Int(usize), ~ROOT_NODE_MASK);
 
-        pub fn unparkAll(
-            address: usize,
-            token: Token,
-        ) void {
-            const FilterCallback = struct {
-                unpark_token: Token,
+            var array = [_]WaitBucket{WaitBucket{}} ** std.math.max(1, wait_bucket_count); 
 
-                pub fn onFilter(self: @This(), waiter: Waiter) FilterOp {
-                    return .{ .Unpark = self.unpark_token };
+            /// Hash an address into a WaitBucket reference.
+            pub fn from(address: usize) *WaitBucket {
+                return &array[address % array.len];
+            }
+
+            /// Acquire ownership of the WaitBucket.
+            /// This provides the ability to lookup the WaitQueue for an address and operate on it.
+            pub fn acquire(self: *WaitBucket, held: *WaitLock.Held) void {
+                self.lock.acquire(held);
+                assert(self.root & IS_BUCKET_LOCKED == 0);
+                self.root |= IS_BUCKET_LOCKED;
+            }
+
+            /// Release ownership of the WaitBucket after having previously acquired it.
+            /// This relenquishes the safety to lookup WaitQueues on this WaitBucket or operate on existing ones.
+            pub fn release(self: *WaitBucket, held: *WaitLock.Held) void {
+                assert(self.root & IS_BUCKET_LOCKED != 0);
+                self.root &= ~IS_BUCKET_LOCKED;
+                self.lock.release(held);
+            }
+
+            /// Lookup the WaitQueue in the WaitBucket for a given address.
+            pub fn queue(self: *WaitBucket, address: usize) WaitQueue {
+                assert(self.root & IS_BUCKET_LOCKED != 0);
+                var parent: ?*WaitNode = null;
+                var head: ?*WaitNode = self.getRoot();
+
+                while (true) {
+                    const node = head orelse break;
+                    if (node.address == address) {
+                        break;
+                    } else {
+                        parent = node;
+                        head = node.children[@boolToInt(node_address > address)];
+                    }
                 }
 
-                pub fn onBeforeWake(self: @This()) void {
-                    // no-op
-                }
-            };
+                return WaitQueue{
+                    .bucket = self,
+                    .address = address,
+                    .parent = parent,
+                    .head = head,
+                };
+            }
 
-            const filter_callback = FilterCallback{ .unpark_token = token };
-            unparkFilter(address, filter_callback);
-        }
+            fn getRoot(self: *WaitBucket) ?*WaitNode {
+                assert(self.root & IS_BUCKET_LOCKED != 0);
+                if (self.root & IS_ROOT_PRNG != 0) {
+                    return null;
+                } else {
+                    return @intToPtr(?*WaitNode, self.root & ROOT_NODE_MASK);
+                }
+            }
+
+            fn setRoot(self: *WaitBucket, new_root: ?*WaitNode) void {
+                assert(self.root & IS_BUCKET_LOCKED != 0);
+                const prng = self.getPrng();
+                if (new_root) |node| {
+                    node.prng = prng;
+                    self.root = @ptrToInt(node) | IS_BUCKET_LOCKED;
+                } else {
+                    self.root = (@as(usize, prng) << PRNG_SHIFT) | IS_BUCKET_LOCKED | IS_ROOT_PRNG;
+                }
+            }
+
+            fn getPrng(self: *WaitBucket) u16 {
+                assert(self.root & IS_BUCKET_LOCKED != 0);
+                if (self.root & IS_ROOT_PRNG != 0) {
+                    return @truncate(u16, self.root >> PRNG_SHIFT);
+                } else {
+                    return @intToPtr(*WaitNode, self.root & ROOT_NODE_MASK).prng;
+                }
+            }
+
+            fn setPrng(self: *WaitBucket, prng: u16) void {
+                assert(self.root & IS_BUCKET_LOCKED != 0);
+                if (self.root & IS_ROOT_PRNG != 0) {
+                    self.root = (@as(usize, prng) << PRNG_SHIFT) | IS_ROOT_PRNG | IS_BUCKET_LOCKED;
+                } else {
+                    @intToPtr(*WaitNode, self.root & ROOT_NODE_MASK).prng = prng;
+                }
+            }
+
+            fn genPrng(self: *WaitBucket, comptime Int: type) Int {
+                assert(self.root & IS_BUCKET_LOCKED != 0);
+
+                var prng = self.getPrng();
+                if (prng == 0) {
+                    prng = @truncate(u16, @ptrToInt(self) >> @sizeOf(usize)) | 1;
+                }
+
+                var rng_parts: [@sizeOf(Int) / @sizeOf(u16)]u16 = undefined;
+                for (rng_parts) |*part| {
+                    prng ^= prng << 7;
+                    prng ^= prng >> 9;
+                    prng ^= prng << 8;
+                    part.* = prng;
+                }
+
+                self.setPrng(prng);
+                return @bitCast(Int, rng_parts);
+            } 
+
+            fn didTimestampExpire(self: *WaitBucket) bool {
+                assert(self.root & IS_BUCKET_LOCKED != 0);
+
+                const now = FairTimestamp.now();
+                if (!self.timestamp.expires(now)) {
+                    return false;
+                }
+                
+                const rng = self.genPrng(u64);
+                self.timestamp.update(now, rng);
+                return true;
+            }
+        };
     };
 }
 
@@ -273,25 +776,33 @@ pub const DefaultEvent = struct {
     const Self = @This();
 
     pub fn init(self: *Self) void {
-        @compileError("TODO");
+        self.is_set = false;
     }
 
     pub fn deinit(self: *Self) void {
-        @compileError("TODO");
+        self.* = undefined;
     }
 
     pub fn reset(self: *Self) void {
-        @compileError("TODO");
+        self.is_set = false;
     }
 
     pub fn set(self: *Self) void {
-        @compileError("TODO");
+        atomic.store(&self.is_set, true, .Release);
     }
 
     pub const Cancellation = void;
 
     pub fn wait(self: *Self, cancellation: ?Cancellation) error{Cancelled}!void {
-        @compileError("TODO");
+        while (true) : (atomic.spinLoopHint()) {
+            if (atomic.load(&self.is_set, .Acquire)) {
+                return;
+            }
+
+            if (cancellation != null) {
+                return error.Cancelled;
+            }
+        }
     }
 };
 
@@ -443,18 +954,26 @@ pub fn DefaultLock(comptime Event: type) type {
 
         pub fn release(self: *Self, held: *Held) void {
             var state: usize = undefined;
-            var slow_mask: usize = undefined;
+            var should_wake: bool = undefined;
             
+            // Drop ownership of the lock by unsetting the LOCKED bit.
+            // If byte-ops are available, we can use an atomic store instead of an rmw op
+            // since the entire LSB byte is reserved for the LOCKED bit.
+            //
+            // Uses a Release barrier to synchronize with the Acquire in tryAcquireFast()
+            // in order to publish memory updates to the next lock-holding thread.
             if (use_byte_ops) {
                 atomic.store(@ptrCast(*u8, &self.state), UNLOCKED, .Release);
                 state = atomic.load(&self.state, .Relaxed);
-                slow_mask = LOCKED | WAKING;
+                should_wake = state & (LOCKED | WAKING) == 0;
             } else {
-                state = atomic.fetchSub(&self.state, LOCKED, .Release);
-                slow_mask = WAKING;
+                state = atomic.fetchAnd(&self.state, ~@as(usize, LOCKED), .Release);
+                should_wake = state & WAKING == 0;
             }
 
-            if ((state & WAITING != 0) and (state & slow_mask != 0)) {
+            // Take the slow path to wake up a waiter only when necessary
+            const has_waiters = state & WAITING != 0;
+            if (has_waiters and should_wake) {
                 self.releaseSlow();
             }
         }
@@ -462,7 +981,108 @@ pub fn DefaultLock(comptime Event: type) type {
         fn releaseSlow(self: *Self) void {
             @setCold(true);
 
-            @compileError("TODO");
+            // In order to dequeue and wake up a Waiter, we must acquire the WAKING bit.
+            // At this point we have release ownership of the Lock so other threads can acquire it while we wake.
+            // If theres no waiters to wake up or if theres already a thread doing the wake-up, we give up.
+            // We also give up if theres a Lock holder since we can leave it to them to do the wake-up instead.
+            var state = atomic.load(&self.state, .Relaxed);
+            while (true) {
+                if ((state & WAITING == 0) or (state & (LOCKED | WAKING) != 0)) {
+                    return;
+                }
+                
+                // Acquire barrier on success which is needed to make visible the waiter.field
+                // writes that were Release'd by the waiter when it enqueued itself.
+                state = atomic.tryCompareAndSwap(
+                    &self.state,
+                    state,
+                    state | WAKING,
+                    .Acquire,
+                    .Relaxed,
+                ) orelse {
+                    state |= WAKING;
+                    break;
+                };
+            }
+
+            while (true) {
+                // Get the head of the wait queue from the state.
+                // This is bound to be a valid pointer as it was confirmed above
+                // when acquiring the WAKING bit and we're the only thread that can now dequeue.
+                const head = @intToPtr(*Waiter, state & WAITING);
+
+                // Search for the tail of the wait queue by starting from the head and following .next fields.
+                // Along the way, link up the .prev fields in order to make the queue a proper doubly-linked-list.
+                //
+                // The loop is bound to end as the first waiter in the queue must have its .tail field set to itself.
+                // Once we find the tail, we can cache it at the head waiter to amortize the cost of future lookups.
+                //
+                // Effectively, we only scan through each Waiter once after it has been enqueued.
+                // So its still O(n) but n = amount of new waiters enqueued since the last wake-up.
+                const tail = head.tail orelse blk: {
+                    var current = head;
+                    while (true) {
+                        const next = current.next orelse unreachable;
+                        next.prev = current;
+                        current = next;
+                        if (current.tail) |tail| {
+                            head.tail = tail;
+                            break :blk tail;
+                        }
+                    }
+                };
+
+                // If the Lock is currently owned, we should leave the wake-up to that thread instead.
+                // For that, we unset the WAKING bit so that thread's eventual releaseSlow() can do the wake up.
+                // 
+                // On success, we need a Release barrier to ensure the next WAKING thread sees the writes when searching for tail we did above.
+                // On failure, we need an Acquire barrier to see the writes to any new Waiters that enqueued themselves as the head.
+                if (state & LOCKED != 0) {
+                    state = atomic.tryCompareAndSwap(
+                        &self.state,
+                        state,
+                        state & ~@as(usize, WAKING),
+                        .AcqRel, // TODO: could be just .Release ?
+                        .Acquire,
+                    ) orelse return;
+                    continue;
+                }
+                
+                // If the tail isn't the last waiter in the queue,
+                // then we dequeue it normally by logically detaching it from the doubly linked list.
+                //
+                // After we dequeued the tail, we need to unset the WAKING bit to allow another thread to wake-up.
+                // This is done with a Release barrier to ensure the next WAKING thread sees the updated head.tail.
+                if (tail.prev) |new_tail| {
+                    head.tail = new_tail;
+                    _ = atomic.fetchAnd(&self.state, ~@as(usize, WAKING), .Release);
+                    tail.event.set();
+                    return;
+                }
+
+                // If this is the last waiter in the queue, then we need to zero out the queue pointer in the state.
+                // While we're zeroing it out, we also unset the WAKING bit so that we can wake up the tail.
+                while (true) {
+                    state = atomic.tryCompareAndSwap(
+                        &self.state,
+                        state,
+                        state & LOCKED,
+                        .AcqRel,
+                        .Relaxed,
+                    ) orelse {
+                        tail.event.set();
+                        return;
+                    };
+                    
+                    // If a new waiter added itself while we were trying to zero out the wait queue state
+                    // then we need to retry the dequeue since the new waiter now references the tail.
+                    // Acquire barrier here in order to ensure we see the waiter writes when we loop back above.
+                    if (@intToPtr(?*Waiter, state & WAITING) != tail) {
+                        atomic.fence(.Acquire);
+                        break;
+                    }
+                }
+            }
         }
     };
 }
