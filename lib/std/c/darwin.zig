@@ -87,6 +87,19 @@ pub extern "c" fn clock_get_time(clock_serv: clock_serv_t, cur_time: *mach_times
 pub extern "c" fn host_get_clock_service(host: host_t, clock_id: clock_id_t, clock_serv: ?[*]clock_serv_t) kern_return_t;
 pub extern "c" fn mach_port_deallocate(task: ipc_space_t, name: mach_port_name_t) kern_return_t;
 
+pub const SWITCH_OPTION_NONE = 0;
+pub const SWITCH_OPTION_DEPRESS = 1;
+pub const SWITCH_OPTION_WAIT = 2;
+pub const SWITCH_OPTION_DISPATCH_CONTENTION = 3;
+pub const SWITCH_OPTION_OSLOCK_DEPRESS = 4;
+pub const SWITCH_OPTION_OSLOCK_WAIT = 5;
+
+pub extern "c" fn thread_switch(
+    thread: mach_port_t,
+    option: c_int,
+    option_time: mach_msg_timeout_t,
+) kern_return_t;
+
 pub const sf_hdtr = extern struct {
     headers: [*]const iovec_const,
     hdr_cnt: c_int,
@@ -210,10 +223,14 @@ pub extern "c" fn dispatch_time(when: dispatch_time_t, delta: i64) dispatch_time
 
 // OS primitive lock used to replace OSSpinLock for unfair mutual exclusion
 // (macOS 10.12+, iOS 10.0+, tvOS 10.0+, watchOS 3.0+, catalyst 13.0+).
+pub const os_lock_owner_t = mach_port_name_t;
+pub const OS_LOCK_NO_OWNER = MACH_PORT_NULL;
+
 pub const OS_UNFAIR_LOCK_INIT = os_unfair_lock{};
 pub const os_unfair_lock_t = *os_unfair_lock;
-pub const os_unfair_lock = extern struct {
-    __opaque: u32 = 0,
+pub const os_unfair_lock = os_unfair_lock_s;
+pub const os_unfair_lock_s = extern struct {
+    oul_value: os_ulock_value_t = 0,
 };
 
 pub extern "c" fn os_unfair_lock_trylock(lock: os_unfair_lock_t) bool;
@@ -227,6 +244,12 @@ pub extern "c" fn os_unfair_lock_assert_not_owner(lock: os_unfair_lock_t) void;
 //
 // [ulock.h]: https://github.com/apple/darwin-xnu/blob/master/bsd/sys/ulock.h
 // [sys_ulock.c]: https://github.com/apple/darwin-xnu/blob/master/bsd/kern/sys_ulock.c
+
+pub const os_ulock_value_t = os_lock_owner_t;
+pub const OS_ULOCK_NOWAITERS_BIT = 1;
+pub inline fn OS_ULOCK_OWNER(value: os_ulock_value_t) os_lock_owner_t {
+    return value | OS_ULOCK_NOWAITERS_BIT;
+}
 
 pub const UL_COMPARE_AND_WAIT = 1;
 pub const UL_UNFAIR_LOCK = 2;
@@ -249,5 +272,5 @@ pub const UL_COMPARE_AND_WAIT64 = 5;
 pub const UL_COMPARE_AND_WAIT64_SHARED = 6;
 pub const ULF_WAIT_ADAPTIVE_SPIN = 0x40000;
 
-pub extern "c" fn __ulock_wait(op: u32, addr: ?*const c_void, val: u64, timeout_us: u32) c_int;
-pub extern "c" fn __ulock_wake(op: u32, addr: ?*const c_void, val: u64) c_int;
+pub extern "c" fn __ulock_wait(op: os_ulock_value_t, addr: ?*const c_void, val: u64, timeout_us: u32) c_int;
+pub extern "c" fn __ulock_wake(op: os_ulock_value_t, addr: ?*const c_void, val: u64) c_int;

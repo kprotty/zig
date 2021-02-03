@@ -48,19 +48,20 @@ test "supports" {
 }
 
 pub fn spinLoopHint() void {
+    comptime var instruction: []const u8 = "";
+
+    // TODO: ARM Thumb v7 supports "yield"
     switch (builtin.arch) {
-        .i386, .x86_64 => asm volatile ("pause"
-            :
-            :
-            : "memory"
-        ),
-        .arm, .aarch64 => asm volatile ("yield"
-            :
-            :
-            : "memory"
-        ),
+        .aarch64 => "yield",
+        .i386, .x86_64 => instruction = "pause",
         else => {},
     }
+
+    asm volatile (instruction
+        :
+        :
+        : "memory"
+    );
 }
 
 test "spinLoopHint" {

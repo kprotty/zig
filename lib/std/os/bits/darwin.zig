@@ -230,6 +230,7 @@ pub const mach_timespec_t = extern struct {
 pub const kern_return_t = c_int;
 pub const host_t = mach_port_t;
 pub const CALENDAR_CLOCK = 1;
+pub const MACH_PORT_NULL = @as(mach_port_t, 0);
 
 pub const PATH_MAX = 1024;
 
