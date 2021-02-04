@@ -163,7 +163,7 @@ pub fn Mutex(comptime parking_lot: type) type {
 
                 const unpark_token = parking_lot.park(
                     @ptrToInt(self),
-                    &cancellation,
+                    if (cancellation) |*cc| cc else null,
                     Parker{ .mutex = self },
                 ) catch |err| switch (err) {
                     error.Invalidated => TOKEN_RETRY,

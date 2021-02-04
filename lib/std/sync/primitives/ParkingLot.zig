@@ -92,7 +92,7 @@ pub fn ParkingLot(comptime Config: type) type {
         // TODO: Document
         pub fn park(
             address: usize,
-            cancellation: Event.Cancellation,
+            cancellation: ?*Event.Cancellation,
             callback: anytype,
         ) error{ Invalidated, Cancelled }!Token {
             var node: WaitNode = undefined;
@@ -1134,7 +1134,7 @@ fn FutexEvent(comptime Futex: type) type {
 
         pub const Cancellation = Futex.Cancellation;
 
-        pub fn wait(self: *Self, _cancellation: Cancellation) error{Cancelled}!void {
+        pub fn wait(self: *Self, cancellation: ?*Cancellation) error{Cancelled}!void {
             if (atomic.compareAndSwap(
                 &self.state,
                 .empty,
@@ -1146,12 +1146,11 @@ fn FutexEvent(comptime Futex: type) type {
                 return;
             }
 
-            var cancellation = _cancellation;
             while (true) {
                 Futex.wait(
                     @ptrCast(*const u32, &self.state),
                     @enumToInt(State.waiting),
-                    if (cancellation) |*cc| cc else null,
+                    cancellation,
                 ) catch break;
 
                 switch (atomic.load(&self.state, .Acquire)) {

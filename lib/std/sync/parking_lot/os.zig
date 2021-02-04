@@ -291,7 +291,7 @@ const PosixParkingLot = ParkingLot(struct {
 
         pub const Cancellation = SystemCancellation;
 
-        pub fn wait(self: *Self, _cancellation: ?Cancellation) error{Cancelled}!void {
+        pub fn wait(self: *Self, cancellation: ?*Cancellation) error{Cancelled}!void {
             assertIn(c.pthread_mutex_lock(&self.mutex), .{0});
             defer assertIn(c.pthread_mutex_unlock(&self.mutex), .{0});
 
@@ -303,7 +303,6 @@ const PosixParkingLot = ParkingLot(struct {
             }
 
             // Wait for the event to be set while sleeping on the pthread_cond_t.
-            var cancellation = _cancellation;
             while (true) {
                 switch (self.state) {
                     .empty => unreachable, // PosixEvent reset while still waiting
@@ -311,14 +310,15 @@ const PosixParkingLot = ParkingLot(struct {
                     .notified => return,
                 }
 
-                if (cancellation) |*cc| {
-                    const timeout = cc.nanoseconds() orelse return error.Cancelled;
-                    var timespec = timespecAfter(timeout);
-                    const rc = c.pthread_cond_timedwait(&self.cond, &self.mutex, &timespec);
-                    assertIn(rc, .{0, std.os.ETIMEDOUT});
-                } else {
+                const cc = cancellation orelse {
                     assertIn(c.pthread_cond_wait(&self.cond, &self.mutex), .{0});
-                }
+                    continue;
+                };
+
+                const timeout = cc.nanoseconds() orelse return error.Cancelled;
+                var timespec = timespecAfter(timeout);
+                const rc = c.pthread_cond_timedwait(&self.cond, &self.mutex, &timespec);
+                assertIn(rc, .{0, std.os.ETIMEDOUT});
             }
         }
 
@@ -631,7 +631,7 @@ const WindowsParkingLot = ParkingLot(struct {
 
         pub const Cancellation = SystemCancellation;
 
-        pub fn wait(self: *Self, _cancellation: ?Cancellation) error{Cancelled}!void {
+        pub fn wait(self: *Self, cancellation: ?*Cancellation) error{Cancelled}!void {
             // Try to mark the event as waiting if its not set.
             if (atomic.compareAndSwap(
                 &self.state,
@@ -647,8 +647,7 @@ const WindowsParkingLot = ParkingLot(struct {
             var timed_out = false;
             var timeout: ?u64 = null;
 
-            var cancellation = _cancellation;
-            if (cancellation) |*cc| {
+            if (cancellation) |cc| {
                 timeout = cc.nanoseconds() orelse {
                     timed_out = true;
                 };
