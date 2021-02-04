@@ -12,90 +12,37 @@ const assert = std.debug.assert;
 
 pub fn ParkingLot(comptime Config: type) type {
     return struct {
-        fn isConfigOptional(comptime field: []const u8) bool {
-            return std.meta.activeTag(@typeInfo(@field(Config, field))) == .Optional;
-        }
-
-        fn hasConfig(comptime field: []const u8) bool {
-            if (!@hasDecl(Config, field)) {
-                return false;
-            } else if (isConfigOptional(field) and @field(Config, field) == null) {
-                return false;
-            } else {
-                return true;
-            }
-        }
-
-        fn getConfig(comptime field: []const u8) getConfigType(field) {
-            const value = @field(Config, field);
-            if (isConfigOptional(field)) {
-                return value orelse unreachable;
-            } else {
-                return value;
-            }
-        }
-
-        fn getConfigType(comptime field: []const u8) type {
-            const FieldType = @TypeOf(@field(Config, field));
-            return switch (@typeInfo(FieldType)) {
-                .Optional => |info| info.child,
-                else => FieldType,
-            };
-        }
+        // TODO: Document
+        pub const Event: type = if (@hasDecl(Config, "Event"))
+            Config.Event
+        else if (@hasDecl(Config, "Futex"))
+            FutexEvent(Config.Futex)
+        else
+            @compileError("ParkingLot requires either an Event or Futex implementation");
 
         // TODO: Document
-        pub const Event = WaitEvent;
-        const WaitEvent: type = switch (hasConfig("Event")) {
-            true => getConfig("Event"),
-            else => switch (hasConfig("Futex")) {
-                true => DefaultFutexEvent(getConfig("Futex")),
-                else => @compileError("ParkingLot requires either a Futex or an Event implementation"),
-            },
-        };
+        pub const Lock: type = if (@hasDecl(Config, "Lock"))
+            Config.Lock
+        else if (@hasDecl(Config, "Futex"))
+            FutexLock(Config.Futex)
+        else
+            EventLock(Event);
 
         // TODO: Document
-        pub const Lock = WaitLock;
-        const WaitLock: type = switch (hasConfig("Lock")) {
-            true => getConfig("Lock"),
-            else => switch (hasConfig("Futex")) {
-                true => DefaultFutexLock(getConfig("Futex")),
-                else => DefaultLock(Event),
-            },
-        };
+        pub const bucket_count: usize = if (@hasDecl(Config, "bucket_count"))
+            Config.bucket_count
+        else
+            std.meta.bitCount(usize) << 2;
 
         // TODO: Document
-        pub const Futex: type = switch (hasConfig("Futex")) {
-            true => getConfig("Futex"),
-            else => DefaultFutex(@This()),
-        };
-
-        // TODO: Document
-        pub const bucket_count = wait_bucket_count;
-        const wait_bucket_count: usize = switch (hasConfig("bucket_count")) {
-            true => getConfig("bucket_count"),
-            else => std.meta.bitCount(usize) << 2,
-        };
-
-        // TODO: Document
-        pub const Timestamp = FairTimestamp;
-        const FairTimestamp: type = switch (hasConfig("Timestamp")) {
-            true => getConfig("Timestamp"),
-            else => struct {
-                const Self = @This();
-
-                pub fn now() Self {
-                    return Self{};
-                }
-
-                pub fn expires(self: *Self, current_now: Self) bool {
+        pub const FairTimeout: fn() u64 = if (@hasDecl(Config, "FairTimeout"))
+            Config.FairTimeout
+        else 
+            struct {
+                pub fn beFair(self: *@This(), rng: u64) bool {
                     return false;
                 }
-
-                pub fn update(self: *Self, current_now: Self, rng: u64) void {
-                    // no-op
-                }
-            },
-        };
+            };
 
         // TODO: Document
         pub const Token = usize;
@@ -117,8 +64,8 @@ pub fn ParkingLot(comptime Config: type) type {
             }
 
             // TODO: Document
-            pub fn didTimestampExpire(self: Waiter) bool {
-                return self._bucket.didTimestampExpire();
+            pub fn beFair(self: Waiter) bool {
+                return self._bucket.beFair();
             }
         };
 
@@ -139,13 +86,13 @@ pub fn ParkingLot(comptime Config: type) type {
         pub const Unparked = struct {
             token: ?Token = null,
             has_more: bool = false,
-            timestamp_expired: bool = false,
+            be_fair: bool = false,
         };
 
         // TODO: Document
         pub fn park(
             address: usize,
-            cancellation: ?*WaitEvent.Cancellation,
+            cancellation: Event.Cancellation,
             callback: anytype,
         ) error{ Invalidated, Cancelled }!Token {
             var node: WaitNode = undefined;
@@ -153,7 +100,7 @@ pub fn ParkingLot(comptime Config: type) type {
             {
                 // Then grab the WaitBucket lock for this address in order to
                 // prepare for an enqueue & synchronize with unpark()
-                var held: WaitLock.Held = undefined;
+                var held: Lock.Held = undefined;
                 const bucket = WaitBucket.from(address);
                 bucket.acquire(&held);
                 defer bucket.release(&held);
@@ -191,7 +138,7 @@ pub fn ParkingLot(comptime Config: type) type {
             if (cancelled) {
                 {
                     var addr: usize = undefined;
-                    var held: WaitLock.Held = undefined;
+                    var held: Lock.Held = undefined;
                     var bucket: *WaitBucket = undefined;
                     defer bucket.release(&held);
 
@@ -226,7 +173,7 @@ pub fn ParkingLot(comptime Config: type) type {
                         callback.onCancel(Unparked{
                             .token = node.token,
                             .has_more = !queue.isEmpty(),
-                            .timestamp_expired = false,
+                            .be_fair = false,
                         });
                     }
                 }
@@ -291,7 +238,7 @@ pub fn ParkingLot(comptime Config: type) type {
                     const unpark_token: Token = self.callback.onUnpark(Unparked{
                         .token = waiter.getToken(),
                         .has_more = waiter.hasMore(),
-                        .timestamp_expired = waiter.didTimestampExpire(),
+                        .be_fair = waiter.beFair(),
                     });
 
                     self.called_unparked = true;
@@ -338,7 +285,7 @@ pub fn ParkingLot(comptime Config: type) type {
             }
 
             // If waiters are discovered, grab the bucket lock in order to dequeue and wake them.
-            var held: WaitLock.Held = undefined;
+            var held: Lock.Held = undefined;
             bucket.acquire(&held);
             defer bucket.release(&held);
 
@@ -401,14 +348,14 @@ pub fn ParkingLot(comptime Config: type) type {
             }
 
             // Acquire the bucket lock for the main address.
-            var held: WaitLock.Held = undefined;
+            var held: Lock.Held = undefined;
             bucket.acquire(&held);
             defer bucket.release(&held);
 
             // Find the bucket for the requeue address and acquire its lock.
             // If the address and requeue_address map to the same bucket,
             // we don't acquire its lock as its the same above and would be UB/deadlock.
-            var requeue_held: WaitLock.Held = undefined;
+            var requeue_held: Lock.Held = undefined;
             const requeue_bucket = WaitBucket.from(requeue_address);
             if (bucket != requeue_bucket) {
                 requeue_bucket.acquire(&requeue_held);
@@ -474,7 +421,7 @@ pub fn ParkingLot(comptime Config: type) type {
             parent: ?*WaitNode,
             children: [2]?*WaitNode,
             xorshift: u16,
-            event: WaitEvent,
+            event: Event,
         };
 
         const WaitList = struct {
@@ -650,17 +597,22 @@ pub fn ParkingLot(comptime Config: type) type {
         /// A WaitBucket is a synchronized collection of WaitQueues.
         /// Each address maps to a given WaitBucket where it can enqueue itself to Wait.
         const WaitBucket = struct {
-            lock: WaitLock = WaitLock{},
-            waiters: usize = 0,
             root: usize = 0,
-            timestamp: FairTimestamp = FairTimestamp{},
+            waiters: usize = 0,
+            lock: Lock = Lock{},
+            fair_timeout: FairTimeout = FairTimeout{},
 
+            // WaitBucket.root tries to compress the ?*WaitNode treap root pointer and the prng state into one:
+            //
+            // If IS_ROOT_PRNG bit is set, then the upper PRNG_SHIFT bits contain the prng state.
+            // If not then the upper bits contain the ?*WaitNode root pointer.
+            // IS_BUCKET_LOCKED is only used for sanity checks when calling WaitBucket functions.
             const IS_ROOT_PRNG: usize = 0b01;
             const IS_BUCKET_LOCKED: usize = 0b10;
             const ROOT_NODE_MASK = ~@as(usize, IS_ROOT_PRNG | IS_BUCKET_LOCKED);
             const PRNG_SHIFT = @popCount(std.math.Log2Int(usize), ~ROOT_NODE_MASK);
 
-            var array = [_]WaitBucket{WaitBucket{}} ** std.math.max(1, wait_bucket_count);
+            var array = [_]WaitBucket{WaitBucket{}} ** std.math.max(1, bucket_count);
 
             /// Hash an address into a WaitBucket reference.
             pub fn from(address: usize) *WaitBucket {
@@ -669,7 +621,7 @@ pub fn ParkingLot(comptime Config: type) type {
 
             /// Acquire ownership of the WaitBucket.
             /// This provides the ability to lookup the WaitQueue for an address and operate on it.
-            pub fn acquire(self: *WaitBucket, held: *WaitLock.Held) void {
+            pub fn acquire(self: *WaitBucket, held: *Lock.Held) void {
                 held.* = self.lock.acquire();
                 assert(self.root & IS_BUCKET_LOCKED == 0);
                 self.root |= IS_BUCKET_LOCKED;
@@ -677,7 +629,7 @@ pub fn ParkingLot(comptime Config: type) type {
 
             /// Release ownership of the WaitBucket after having previously acquired it.
             /// This relenquishes the safety to lookup WaitQueues on this WaitBucket or operate on existing ones.
-            pub fn release(self: *WaitBucket, held: *WaitLock.Held) void {
+            pub fn release(self: *WaitBucket, held: *Lock.Held) void {
                 assert(self.root & IS_BUCKET_LOCKED != 0);
                 self.root &= ~IS_BUCKET_LOCKED;
                 held.release();
@@ -707,7 +659,7 @@ pub fn ParkingLot(comptime Config: type) type {
                 };
             }
 
-            fn getRoot(self: *WaitBucket) ?*WaitNode {
+            pub fn getRoot(self: *WaitBucket) ?*WaitNode {
                 assert(self.root & IS_BUCKET_LOCKED != 0);
                 if (self.root & IS_ROOT_PRNG != 0) {
                     return null;
@@ -716,7 +668,7 @@ pub fn ParkingLot(comptime Config: type) type {
                 }
             }
 
-            fn setRoot(self: *WaitBucket, new_root: ?*WaitNode) void {
+            pub fn setRoot(self: *WaitBucket, new_root: ?*WaitNode) void {
                 assert(self.root & IS_BUCKET_LOCKED != 0);
                 const prng = self.getPrng();
                 if (new_root) |node| {
@@ -745,7 +697,7 @@ pub fn ParkingLot(comptime Config: type) type {
                 }
             }
 
-            fn genPrng(self: *WaitBucket, comptime Int: type) Int {
+            pub fn genPrng(self: *WaitBucket, comptime Int: type) Int {
                 assert(self.root & IS_BUCKET_LOCKED != 0);
 
                 var prng = self.getPrng();
@@ -765,23 +717,17 @@ pub fn ParkingLot(comptime Config: type) type {
                 return @bitCast(Int, rng_parts);
             }
 
-            fn didTimestampExpire(self: *WaitBucket) bool {
+            pub fn beFair(self: *WaitBucket) bool {
                 assert(self.root & IS_BUCKET_LOCKED != 0);
 
-                const now = FairTimestamp.now();
-                if (!self.timestamp.expires(now)) {
-                    return false;
-                }
-
-                const rng = self.genPrng(u64);
-                self.timestamp.update(now, rng);
-                return true;
+                const fair_rng = self.genPrng(u64);
+                return self.fair_timeout.beFair(fair_rng);
             }
         };
     };
 }
 
-fn DefaultLock(comptime Event: type) type {
+fn EventLock(comptime Event: type) type {
     return extern struct {
         state: usize = UNLOCKED,
 
@@ -1066,65 +1012,7 @@ fn DefaultLock(comptime Event: type) type {
     };
 }
 
-fn DefaultFutex(comptime parking_lot) type {
-    return struct {
-        pub const Cancellation = parking_lot.Event.Cancellation;
-
-        pub fn wait(ptr: *const u32, expected: u32, cancellation: ?*Cancellation) error{Cancelled}!void {
-            const Parker = struct {
-                wait_ptr: *const u32,
-                wait_expect: u32,
-
-                pub fn onValidate(self: @This()) ?parking_lot.Token {
-                    if (atomic.load(self.wait_ptr, .SeqCst) == self.wait_expect) {
-                        return 0;
-                    } else {
-                        return null;
-                    }
-                }
-
-                pub fn onBeforeWait(self: @This()) void {
-                    // no-op
-                }
-
-                pub fn onCancel(self: @This(), unparked: parking_lot.Unparked) void {
-                    // no-op
-                }
-            };
-
-            _ = parking_lot.park(
-                @ptrToInt(ptr) >> @sizeOf(u32),
-                cancellation,
-                Parker{
-                    .wait_ptr = ptr,
-                    .wait_expect = expected,
-                },
-            ) catch |err| switch (err) {
-                error.Invalidated => {},
-                error.Cancelled => return error.Cancelled,
-            };
-        }
-
-        pub fn wake(ptr: *const u32) void {
-            const Unparker = struct {
-                pub fn onUnpark(self: @This(), unparked: parking_lot.Unparked) parking_lot.Token {
-                    return 0;
-                }
-            };
-
-            parking_lot.unparkOne(
-                @ptrToInt(ptr) >> @sizeOf(u32),
-                Unparker{},
-            );
-        }
-
-        pub fn yield(iteration: usize) bool {
-            return parking_lot.Event.yield(iteration);
-        }
-    };
-}
-
-fn DefaultFutexLock(comptime Futex: type) type {
+fn FutexLock(comptime Futex: type) type {
     return struct {
         state: State = .unlocked,
 
@@ -1213,7 +1101,7 @@ fn DefaultFutexLock(comptime Futex: type) type {
     };
 }
 
-fn DefaultFutexEvent(comptime Futex: type) type {
+fn FutexEvent(comptime Futex: type) type {
     return struct {
         state: State,
 
@@ -1246,7 +1134,7 @@ fn DefaultFutexEvent(comptime Futex: type) type {
 
         pub const Cancellation = Futex.Cancellation;
 
-        pub fn wait(self: *Self, cancellation: ?*Cancellation) error{Cancelled}!void {
+        pub fn wait(self: *Self, _cancellation: Cancellation) error{Cancelled}!void {
             if (atomic.compareAndSwap(
                 &self.state,
                 .empty,
@@ -1258,11 +1146,12 @@ fn DefaultFutexEvent(comptime Futex: type) type {
                 return;
             }
 
+            var cancellation = _cancellation;
             while (true) {
                 Futex.wait(
                     @ptrCast(*const u32, &self.state),
                     @enumToInt(State.waiting),
-                    cancellation,
+                    if (cancellation) |*cc| cc else null,
                 ) catch break;
 
                 switch (atomic.load(&self.state, .Acquire)) {
@@ -1287,3 +1176,31 @@ fn DefaultFutexEvent(comptime Futex: type) type {
         }
     };
 }
+
+pub const SerialParkingLot = ParkingLot(struct {
+    pub const Futex = struct {
+        pub const Cancellation = @import("../parking_lot/os.zig").Event.Cancellation;
+
+        pub fn wait(ptr: *const u32, expected: u32, cancellation: ?*Cancellation) error{Cancelled}!void {
+            if (ptr.* != expected) {
+                return;
+            }
+
+            if (cancellation) |cc| {
+                const timeout = cc.nanoseconds() orelse return error.Cancelled;
+                std.time.sleep(timeout);
+                return error.Cancelled;
+            }
+
+            std.debug.panic("deadlock detected", .{});
+        }
+
+        pub fn wake(ptr: *const u32) void {
+            // no-op
+        }
+
+        pub fn yield(iteration: usize) bool {
+            return false;
+        }
+    };
+});

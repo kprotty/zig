@@ -26,10 +26,7 @@ pub const event = with(@import("./parking_lot/event.zig"));
 pub fn with(comptime parking_lot_backend: type) type {
     return struct {
         pub const parking_lot = parking_lot_backend;
-        pub const Event = parking_lot.Event;
-        pub const Futex = parking_lot.Futex;
-        pub const Lock = parking_lot.Lock;
-
+        
         pub const Mutex = core.Mutex(parking_lot);
     };
 }
