@@ -8,20 +8,18 @@ const std = @import("std.zig");
 const root = @import("root");
 
 pub const atomic = @import("./sync/atomic.zig");
-pub const futex = @import("./sync/futex.zig");
 pub const primitives = @import("./sync/primitives.zig");
 
 pub usingnamespace if (@hasDecl(root, "sync"))
     root.sync
 else if (std.builtin.single_threaded)
-    primitives.debug
+    primitives.serial
 else if (std.io.mode == .evented)
-    primitives.with(futex.event)
+    primitives.event
 else
-    primitives.with(futex.os);
+    primitives.os;
 
 test "sync" {
     _ = atomic;
-    _ = futex;
     _ = primitives;
 }

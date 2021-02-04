@@ -258,7 +258,7 @@ test "now" {
     testing.expect(time_2 >= time_0);
 }
 
-const Clock = enum {
+pub const Clock = enum {
     /// A precise clock is one which has nanosecond precision.
     /// Any other properties such as performance or being monotonic are not guaranteed. 
     Precise,

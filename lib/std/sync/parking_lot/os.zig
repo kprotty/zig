@@ -6,120 +6,157 @@
 
 const std = @import("../../std.zig");
 const atomic = @import("../atomic.zig");
-const generic = @import("./generic.zig");
-const SpinFutex = @import("./spin.zig");
+const SpinParkingLot = @import("./spin.zig");
+const ParkingLot = @import("../primitives.zig").core.ParkingLot;
 
 const builtin = std.builtin;
 const assert = std.debug.assert;
 
 pub usingnamespace if (builtin.os.tag == .windows)
-    WindowsFutex
+    WindowsParkingLot
 else if (builtin.os.tag == .linux)
-    LinuxFutex
+    LinuxParkingLot
 else if (std.Target.current.isDarwin())
-    DarwinFutex
+    DarwinParkingLot
 else if (builtin.link_libc)
-    PosixFutex
+    PosixParkingLot
 else
-    SpinFutex;
+    UnknownOsParkingLot;
 
-const LinuxFutex = struct {
-    const linux = std.os.linux;
+const UnknownOsParkingLot = struct {
+    pub usingnamespace ParkingLot(struct {
+        pub const Futex = UnknownOsFutex;
+        pub const Timestamp = SystemTimestamp;
+    });
 
-    pub const Lock = generic.GenericFutexLock(@This());
+    const UnknownOsFutex = struct {
+        pub const Cancellation = SystemCancellation;
 
-    pub fn wait(ptr: *const u32, expected: u32, timeout: ?u64) error{TimedOut}!void {
-        var ts: linux.timespec = undefined;
-        var ts_ptr: ?*const linux.timespec = null;
+        pub fn wait(ptr: *const u32, expected: u32, cancellation: ?*Cancellation) error{Cancelled}!void {
+            while (true) {
+                if (atomic.load(ptr, .SeqCst) != expected) {
+                    return;
+                }
 
-        if (timeout) |timeout_ns| {
-            const secs = @divFloor(timeout_ns, std.time.ns_per_s);
-            const nsecs = @mod(timeout_ns, std.time.ns_per_s);
-            ts_ptr = &ts;
-            ts.tv_sec = std.math.cast(@TypeOf(ts.tv_sec), secs) catch std.math.maxInt(@TypeOf(ts.tv_sec));
-            ts.tv_nsec = std.math.cast(@TypeOf(ts.tv_nsec), nsecs) catch std.math.maxInt(@TypeOf(ts.tv_nsec));
+                std.time.sleep(blk: {
+                    if (cancellation) |cc| {
+                        break :blk (cc.nanoseconds() orelse return error.Cancelled);
+                    } else {
+                        break :blk (10 * std.time.ns_per_ms);
+                    }
+                });
+            }
         }
 
-        switch (linux.getErrno(linux.futex_wait(
-            @ptrCast(*const i32, ptr),
-            linux.FUTEX_PRIVATE_FLAG | linux.FUTEX_WAIT,
-            @bitCast(i32, expected),
-            ts_ptr,
-        ))) {
-            0 => {},
-            std.os.EINTR => {},
-            std.os.EAGAIN => {},
-            std.os.ETIMEDOUT => return error.TimedOut,
-            else => |errno| {
-                const err = std.os.unexpectedErrno(errno);
-                unreachable;
-            },
+        pub fn wake(ptr: *const u32) void {
+            // no-op
         }
-    }
 
-    pub fn wake(ptr: *const u32) void {
-        switch (linux.getErrno(linux.futex_wake(
-            @ptrCast(*const i32, ptr),
-            linux.FUTEX_PRIVATE_FLAG | linux.FUTEX_WAKE,
-            1, // max waiters to wake
-        ))) {
-            0 => {},
-            std.os.EACCES => {},
-            std.os.EFAULT => {},
-            std.os.EINVAL => {},
-            else => |errno| {
-                const err = std.os.unexpectedErrno(errno);
-                unreachable;
-            },
-        }
-    }
-
-    pub fn yield(iteration: usize) bool {
-        if (iteration > 10) {
+        pub fn yield(iteration: usize) bool {
             return false;
         }
-
-        // On linux we don't use sched_yield...
-        // https://www.realworldtech.com/forum/?threadid=189711&curpostid=189752
-        //
-        // As per the maximum spin count, it;s the same as glibc:
-        // But instead of static/single spins in glibc, we do spinning wih a backoff
-        // https://elixir.bootlin.com/glibc/latest/source/sysdeps/generic/adaptive_spin_count.h
-        var spins = blk: {
-            const max_spins = 100;
-            const shift = @intCast(std.math.Log2Int(usize), iteration);
-            break :blk std.math.min(max_spins, @as(usize, 1) << shift);
-        };
-
-        while (spins > 0) : (spins -= 1) {
-            atomic.spinLoopHint();
-        }
-
-        return true;
-    }
+    };
 };
 
-const DarwinFutex = struct {
-    const darwin = std.os.darwin;
-    const Futex = if (UlockFutex.is_supported) UlockFutex else PosixFutex;
+const LinuxParkingLot = struct {
+    pub usingnamespace ParkingLot(struct {
+        pub const Futex = LinuxFutex;
+        pub const Timestamp = SystemTimestamp;
+        // Linux futex internally multiplies this by logical cpu core count,
+        // but since we use tree based lookup instead of linked lists, this is probably enough.
+        pub const bucket_count = 256; 
+    });
 
-    pub const Lock = Futex.Lock;
+    const LinuxFutex = struct {
+        const linux = std.os.linux;
 
-    pub fn wait(ptr: *const u32, expected: u32, timeout: ?u64) error{TimedOut}!void {
-        return Futex.wait(ptr, expected, timeout);
-    }
+        pub const Cancellation = SystemCancellation;
 
-    pub fn wake(ptr: *const u32) void {
-        return Futex.wake(ptr);
-    }
+        pub fn wait(ptr: *const u32, expected: u32, cancellation: ?*Cancellation) error{Cancelled}!void {
+            var ts: linux.timespec = undefined;
+            var ts_ptr: ?*const linux.timespec = null;
 
-    pub fn yield(iteration: usize) bool {
-        // Its not really benefitial to yield on darwin unless using the low-level Futex lock.
-        return false;
-    }
+            if (cancellation) |cc| {
+                const timeout_ns = cc.nanoseconds() orelse return error.Cancelled;
+                const secs = @divFloor(timeout_ns, std.time.ns_per_s);
+                const nsecs = @mod(timeout_ns, std.time.ns_per_s);
 
-    const UlockFutex = struct {
+                ts_ptr = &ts;
+                ts.tv_sec = std.math.cast(@TypeOf(ts.tv_sec), secs) catch std.math.maxInt(@TypeOf(ts.tv_sec));
+                ts.tv_nsec = std.math.cast(@TypeOf(ts.tv_nsec), nsecs) catch std.math.maxInt(@TypeOf(ts.tv_nsec));
+            }
+
+            switch (linux.getErrno(linux.futex_wait(
+                @ptrCast(*const i32, ptr),
+                linux.FUTEX_PRIVATE_FLAG | linux.FUTEX_WAIT,
+                @bitCast(i32, expected),
+                ts_ptr,
+            ))) {
+                0 => {},
+                std.os.EINTR => {},
+                std.os.EAGAIN => {},
+                std.os.ETIMEDOUT => return error.Cancelled,
+                else => |errno| {
+                    const err = std.os.unexpectedErrno(errno);
+                    unreachable;
+                },
+            }
+        }
+
+        pub fn wake(ptr: *const u32) void {
+            switch (linux.getErrno(linux.futex_wake(
+                @ptrCast(*const i32, ptr),
+                linux.FUTEX_PRIVATE_FLAG | linux.FUTEX_WAKE,
+                1, // max waiters to wake
+            ))) {
+                0 => {},
+                std.os.EACCES => {},
+                std.os.EFAULT => {},
+                std.os.EINVAL => {},
+                else => |errno| {
+                    const err = std.os.unexpectedErrno(errno);
+                    unreachable;
+                },
+            }
+        }
+
+        pub fn yield(iteration: usize) bool {
+            if (iteration > 10) {
+                return false;
+            }
+
+            // On linux we don't use sched_yield...
+            // https://www.realworldtech.com/forum/?threadid=189711&curpostid=189752
+            //
+            // As per the maximum spin count, it's the same as glibc:
+            // https://elixir.bootlin.com/glibc/latest/source/sysdeps/generic/adaptive_spin_count.h
+            //
+            // But instead of static/single spins in glibc, we do spinning wih a backoff
+            // as this appears to be faster throughput wise in various benchmarks.
+            var spins = blk: {
+                const max_spins = 100;
+                const shift = @intCast(std.math.Log2Int(usize), iteration);
+                break :blk std.math.min(max_spins, @as(usize, 1) << shift);
+            };
+
+            while (spins > 0) : (spins -= 1) {
+                atomic.spinLoopHint();
+            }
+
+            return true;
+        }
+    };    
+};
+
+const DarwinParkingLot = struct {
+    pub usingnamespace if (UlockParkingLot.is_supported)
+        UlockParkingLot
+    else
+        PosixParkingLot;
+
+    const UlockParkingLot = struct {
         // See: https://github.com/apple/darwin-libplatform/search?q=OS_UNFAIR_LOCK_AVAILABILITY
+        const darwin = std.os.darwin;
         const version = std.Target.current.os.version_range.semver.min;
         const is_supported = switch (builtin.os.tag) {
             .macos => (version.major >= 10) and (version.minor >= 12),
@@ -128,208 +165,152 @@ const DarwinFutex = struct {
             .watchos => (version.major >= 3) and (version.minor >= 0),
             else => unreachable,
         };
-        
-        const Lock = struct {
-            os_lock: darwin.os_unfair_lock = darwin.OS_UNFAIR_LOCK_INIT,
 
-            pub fn acquire(self: *Lock) void {
-                if (!darwin.os_unfair_lock_trylock(&self.os_lock)) {
-                    self.acquireSlow();
-                }
-            }
+        pub usingnamespace ParkingLot(struct {
+            pub const Futex = UlockFutex;
+            pub const Timestamp = SystemTimestamp;
+            pub const bucket_count = 64;
+        });
 
-            fn acquireSlow(self: *Lock) void {
-                @setCold(true);
+        const UlockFutex = struct {
+            pub const Cancellation = SystemCancellation;
 
-                // os_unfair_lock_lock() doesn't spin before calling __ulock_wait()
-                // due to CPU spinning or yielding wasting battery and being ineffective 
-                // on mobile platforms such as iOS and watchOS.
-                //
-                // Adaptive spinning appears to actually be performant for micro-contention
-                // under certain environments so we implement it manually here in accordance 
-                // to os_unfair_lock internals:
-                // https://github.com/apple/darwin-libplatform/blob/main/src/os/lock.c
-                //
-                // These are the max spin counts before yielding for OSSpinLock:
-                // https://github.com/apple/darwin-libplatform/search?q=OS_LOCK_SPIN_SPIN_TRIES
-                const max_adaptive_spin = switch (builtin.os.tag) {
-                    .macos => switch (builtin.arch) {
-                        .arm, .aarch64 => 100,
-                        else => 1000,
-                    },
-                    else => 0, // don't spin on non-desktop/laptop devices
-                };
-
-                var adaptive_spin: usize = 0;
-                while (adaptive_spin < max_adaptive_spin) : (adaptive_spin += 1) {
-                    // If there's threads waiting on the lock, then theres no need to spin.
-                    // Mach port values are assumed to always have OS_ULOCK_NOWAITERS_BIT set.
-                    // When unset, it indicates the existence of waiting threads for unlock.
-                    const oul_value = atomic.load(&self.os_lock.oul_value, .Relaxed);
-                    if (oul_value & darwin.OS_ULOCK_NOWAITERS_BIT == 0) {
-                        break;
-                    }
-
-                    // Try to grab the lock when its unlocked.
-                    if (oul_value == OS_LOCK_NO_OWNER) {
-                        if (darwin.os_unfair_lock_trylock(&self.os_lock)) {
-                            return;
-                        }
-                    }
-
-                    // On the last runs of spinning, yield the OS thread instead of spinning.
-                    // Since we're working with os_unfair_lock, we know which thread to yield to. 
-                    if (adaptive_spin < max_adaptive_spin - 5) {
-                        atomic.spinLoopHint();
-                    } else {
-                        _ = darwin.thread_switch(
-                            darwin.OS_ULOCK_OWNER(oul_value),
-                            darwin.SWITCH_OPTION_DEPRESS,
-                            1, // timeout_ms
-                        );
-                    }
+            pub fn wait(ptr: *const u32, expected: u32, cancellation: ?*Cancellation) error{Cancelled}!void {
+                // timeout = 0 indicates TIMEOUT_WAIT_FOREVER
+                // https://github.com/apple/darwin-xnu/blob/main/bsd/kern/sys_ulock.c
+                var timeout_us: u32 = 0;
+                if (cancellation) |cc| {
+                    const timeout_ns = cc.nanoseconds() orelse return error.Cancelled;
+                    const timeout_unit = timeout_ns / std.time.ns_per_us;
+                    timeout_us = std.math.cast(u32, timeout_unit) catch std.math.maxInt(u32);
                 }
 
-                // Fallback to normal blocking lock.
-                darwin.os_unfair_lock_lock(&self.os_lock);
-            }
-
-            pub fn release(self: *Self) void {
-                darwin.os_unfair_lock_unlock(&self.os_lock);
-            }
-        };
-
-        fn wait(ptr: *const u32, expected: u32, timeout: ?u64) error{TimedOut}!void {
-            // timeout = 0 indicates TIMEOUT_WAIT_FOREVER
-            // https://github.com/apple/darwin-xnu/blob/main/bsd/kern/sys_ulock.c
-            var timeout_us: u32 = 0;
-            if (timeout) |timeout_ns| {
-                const timeout_unit = timeout_ns / std.time.ns_per_us;
-                timeout_us = std.math.cast(u32, timeout_unit) catch std.math.maxInt(u32);
-            }
-
-            const rc = darwin.__ulock_wait(
-                darwin.UL_COMPARE_AND_WAIT | darwin.ULF_NO_ERRNO,
-                @ptrCast(*const c_void, ptr),
-                @as(u64, expect),
-                timeout_us,
-            );
-
-            if (ret < 0) {
-                switch (-ret) {
-                    darwin.EINTR => continue,
-                    darwin.EFAULT => unreachable,
-                    darwin.ETIMEDOUT => return error.TimedOut,
-                    else => |errno| {
-                        const err = std.os.unexpectedErrno(@intCast(usize, errno));
-                        unreachable;
-                    },
-                }
-            }
-        }
-
-        fn wake(ptr: *const u32) void {
-            while (true) {
-                const ret = darwin.__ulock_wake(
+                const rc = darwin.__ulock_wait(
                     darwin.UL_COMPARE_AND_WAIT | darwin.ULF_NO_ERRNO,
                     @ptrCast(*const c_void, ptr),
-                    @as(u64, 0),
+                    @as(u64, expect),
+                    timeout_us,
                 );
 
                 if (ret < 0) {
                     switch (-ret) {
-                        darwin.ENOENT => {},
-                        darwin.EFAULT => {},
                         darwin.EINTR => continue,
+                        darwin.EFAULT => unreachable,
+                        darwin.ETIMEDOUT => return error.Cancelled,
                         else => |errno| {
                             const err = std.os.unexpectedErrno(@intCast(usize, errno));
                             unreachable;
                         },
                     }
                 }
-
-                return;
             }
+
+            pub fn wake(ptr: *const u32) void {
+                while (true) {
+                    const ret = darwin.__ulock_wake(
+                        darwin.UL_COMPARE_AND_WAIT | darwin.ULF_NO_ERRNO,
+                        @ptrCast(*const c_void, ptr),
+                        @as(u64, 0),
+                    );
+
+                    if (ret < 0) {
+                        switch (-ret) {
+                            darwin.ENOENT => {},
+                            darwin.EFAULT => {},
+                            darwin.EINTR => continue,
+                            else => |errno| {
+                                const err = std.os.unexpectedErrno(@intCast(usize, errno));
+                                unreachable;
+                            },
+                        }
+                    }
+
+                    return;
+                }
+            }
+
+            pub fn yield(iteration: usize) bool {
+                if (iteration >= 5) {
+                    return false;
+                }
+                
+                // After benchmarking on M1/BigSur, this appears to be a decent spin count for various cases.
+                var spin = @as(usize, 8) << @intCast(std.math.Log2Int(usize), iteration);
+                while (spin > 0) : (spin -= 1) {
+                    atomic.spinLoopHint();
+                }
+
+                return true;
+            }
+        };
+    };
+};
+
+const PosixParkingLot = struct {
+    pub usingnamespace ParkingLot(struct {
+        pub const Event = PosixEvent;
+        pub const Timestamp = SystemTimestamp;
+        pub const bucket_count = std.meta.bitCount(usize);
+    });
+
+    const PosixEvent = struct {
+        state: State,
+        cond: c.pthread_cond_t,
+        mutex: c.pthread_mutex_t,
+        
+        const c = std.c;
+        const Self = @This();
+        const State = enum {
+            empty,
+            waiting,
+            notified,
+        };
+
+        pub fn init(self: *Self) void {
+            @compileError("TODO");
+        }
+
+        pub fn deinit(self: *Self) void {
+            @compileError("TODO");
+        }
+
+        pub fn reset(self: *Self) void {
+            @compileError("TODO");
+        }
+
+        pub fn set(self: *Self) void {
+            @compileError("TODO");
+        }
+
+        pub const Cancellation = SystemCancellation;
+
+        pub fn wait(self: *Self, cancellation: ?Cancellation) error{Cancelled}!void {
+            @compileError("TODO");
+        }
+
+        pub fn yield(iteration: usize) bool {
+            // Appears to be a good spin limit for sched_yield() calls
+            // https://trac.webkit.org/browser/webkit/trunk/Source/WTF/wtf/WordLock.cpp#L67
+            if (iteration >= 40) {
+                return false;
+            }
+
+            std.os.sched_yield() catch {};
+            return true;
         }
     };
 };
 
-const PosixFutex = struct {
-    const c = std.c;
-    const Futex = generic.GenericFutex(struct {
-        pub const Event: type = PosixEvent;
-        pub const Timestamp: type = PosixTimestamp;
-        pub const bucket_count: usize = std.meta.bitCount(usize);
-    });
-
-    pub const Lock = Futex.Lock;
-
-    pub fn wait(ptr: *const u32, expected: u32, timeout: ?u64) error{TimedOut}!void {
-        return futex.wait(ptr, expected, timeout);
-    }
-
-    pub fn wake(ptr: *const u32) void {
-        return futex.wake(ptr);
-    }
-
-    pub fn yield(iteration: usize) bool {
-        // Appears to be a good spin limit for sched_yield() calls
-        // https://trac.webkit.org/browser/webkit/trunk/Source/WTF/wtf/WordLock.cpp#L67
-        if (iteration >= 40) {
-            return false;
-        }
-
-        std.os.sched_yield() catch {};
-        return true;
-    }
-
-    const PosixTimestamp = struct {};
-
-    const PosixEvent = struct {};
-};
-
-const WindowsFutex = struct {
+const WindowsParkingLot = struct {
     const windows = std.os.windows;
-    const futex = GenericFutex(struct {
-        pub const Lock: type = NtEventLock;
-        pub const Event: type = NtEvent;
-        pub const Timestamp: type = NtTimestamp;
-        pub const bucket_count: usize = 128;
+
+    pub usingnamespace ParkingLot(struct {
+        pub const Lock = if (SRWLock.is_supported) SRWLock else NtLock;
+        pub const Event = NtEvent;
+        pub const Timestamp = NtTimestamp;
+        // same size as windows.PEB.WaitOnAddressHashTable
+        pub const bucket_count = 128; 
     });
-
-    /// Use our implemented Lock when available instead of the generic Futex one.
-    pub const Lock = if (SRWLock.is_supported) SRWLock else NtLock;
-
-    pub fn wait(ptr: *const u32, expected: u32, timeout: ?u64) error{TimedOut}!void {
-        return futex.wait(ptr, expected, timeout);
-    }
-
-    pub fn wake(ptr: *const u32) void {
-        return futex.wake(ptr);
-    }
-
-    pub fn yield(iteration: usize) bool {
-        // Uses an adaptive spinning strategy where the spin count is based on kernel32's CRITICAL_SECTION.
-        // https://docs.microsoft.com/en-us/windows/win32/api/synchapi/nf-synchapi-initializecriticalsectionandspincount
-        const max_iteration = 4000;
-        if (iteration >= max_iteration) {
-            return false;
-        }
-
-        // adaptive yielding:
-        // - yield hardware thread (hyperthreading)
-        // - yield OS thread to another running on same core
-        // - yield OS thread to another running anywhere in system
-        if (iteration < max_iteration - 20) {
-            atomic.spinLoopHint();
-        } else if (iteration < max_iteration - 10) {
-            _ = windows.kernel32.SwitchToThread();
-        } else {
-            windows.kernel32.Sleep(0);
-        }
-
-        return true;
-    }
 
     /// Slim-Reader/Writer Locks is a fast RWLock provided by kernel32 from Windows Vista and onwards.
     /// It has the opportunity to be priority inheritant in the future so we use this for our Futex.Lock impl
@@ -351,22 +332,8 @@ const WindowsFutex = struct {
         }
     };
 
-    /// A ParkingLot Config-friendly wrapper for NtLock down below.
-    const NtEventLock = struct {
-        nt_lock: NtLock = .{},
-
-        const Self = @This();
-        pub const Held = void;
-
-        pub fn acquire(self: *Self, held: *Held) void {
-            return self.nt_lock.acquire();
-        }
-
-        pub fn release(self: *Self, held: *Held) void {
-            return self.nt_lock.release();
-        }
-    };
-
+    /// Custom ParkingLot.Timestamp implementation which is
+    /// less precise than std.time.now() but faster to query.
     const NtTimestamp = struct {
         interrupt_time_100ns: u64,
 
@@ -516,7 +483,7 @@ const WindowsFutex = struct {
 
         const Self = @This();
 
-        pub fn acquire(self: *Self) void {
+        pub fn acquire(self: *Self) Held {
             // Fast-path acquire the lock (is most times inlined)
             const acquired = switch (builtin.arch) {
                 // On x86, use "lock bts" since it has a smaller icache footprint.
@@ -540,6 +507,8 @@ const WindowsFutex = struct {
             if (!acquired) {
                 self.acquireSlow();
             }
+
+            return Held{ .lock = self };
         }
 
         fn acquireSlow(self: *Self) void {
@@ -612,7 +581,15 @@ const WindowsFutex = struct {
             }
         }
 
-        pub fn release(self: *Self) void {
+        pub const Held = struct {
+            lock: *Self,
+
+            pub fn release(self: Held) void {
+                self.lock.release();
+            }
+        };
+
+        fn release(self: *Self) void {
             // We unlock the Lock by zeroing out the LOCKED bit.
             // The LOCKED bit has its own byte which allows us to use a store() instead of RMW op.
             // The former is overall faster than the latter as LL/SC loops or bus-locked instructions are avoided.
@@ -691,9 +668,9 @@ const WindowsFutex = struct {
             }
         }
 
-        pub const Cancellation = u64;
+        pub const Cancellation = SystemCancellation;
 
-        pub fn wait(self: *Self, deadline: ?u64) error{Cancelled}!void {
+        pub fn wait(self: *Self, _cancellation: ?Cancellation) error{Cancelled}!void {
             // Try to mark the event as waiting if its not set.
             if (atomic.compareAndSwap(
                 &self.state,
@@ -708,12 +685,12 @@ const WindowsFutex = struct {
 
             var timed_out = false;
             var timeout: ?u64 = null;
-            if (deadline) |deadline_ns| {
-                const now_ns = std.time.now();
-                timed_out = now_ns > deadline_ns;
-                if (!timed_out) {
-                    timeout = deadline_ns - now_ns;
-                }
+
+            var cancellation = _cancellation;
+            if (cancellation) |*cc| {
+                timeout = cc.nanoseconds() orelse {
+                    timed_out = true;
+                };
             }
 
             if (!timed_out) {
@@ -745,5 +722,69 @@ const WindowsFutex = struct {
                 ) catch unreachable;
             }
         }
+
+        pub fn yield(iteration: usize) bool {
+            // Uses an adaptive spinning strategy where the spin count is based on kernel32's CRITICAL_SECTION.
+            // https://docs.microsoft.com/en-us/windows/win32/api/synchapi/nf-synchapi-initializecriticalsectionandspincount
+            const max_iteration = 4000;
+            if (iteration >= max_iteration) {
+                return false;
+            }
+
+            // adaptive yielding:
+            // - yield hardware thread (hyperthreading)
+            // - yield OS thread to another running on same core
+            // - yield OS thread to another running anywhere in system
+            if (iteration < max_iteration - 20) {
+                atomic.spinLoopHint();
+            } else if (iteration < max_iteration - 10) {
+                _ = windows.kernel32.SwitchToThread();
+            } else {
+                windows.kernel32.Sleep(0);
+            }
+
+            return true;
+        }
     };
 };
+
+/// A ParkingLot timestamp which expires around every 1ms according to the system
+const SystemTimestamp = struct {
+    timestamp: u64 = 0,
+
+    const Self = @This();
+
+    pub fn now() Self {
+        // Use std.time.Clock.Precise instead of std.time.now() since we don't need the monotonic property.
+        return Self{ .timestamp = std.time.Clock.Precide.read() orelse 0 };
+    }
+
+    pub fn expires(self: Self, current_now: Self) bool {
+        return current_now.timestamp > self.timestamp;
+    }
+
+    pub fn update(self: *Self, current_now: Self, rng: u64) void {
+        self.timestamp = current_now.timestamp;
+        self.timestamp +%= rng % (1 * std.time.ns_per_ms);
+    }
+};
+
+const SystemCancellation = union(enum) {
+    duration: u64,
+    deadline: u64,
+
+    fn nanoseconds(self: *@This()) ?u64 {
+        const now = std.time.now();
+        switch (self) {
+            .duration => |duration| {
+                self.* = .{ .deadline = now + duration };
+                return duration;
+            },
+            .deadline => |deadline| {
+                if (now > deadline) return null;
+                return deadline - now;
+            },
+        }
+    }
+};
+
