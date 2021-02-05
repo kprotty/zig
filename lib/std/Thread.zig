@@ -10,7 +10,7 @@
 
 data: Data,
 
-pub usingnamespace std.sync.primitives.with(std.sync.futex.os);
+pub usingnamespace std.sync.primitives.os;
 
 pub const use_pthreads = std.Target.current.os.tag != .windows and builtin.link_libc;
 

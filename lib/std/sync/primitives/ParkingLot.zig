@@ -4,8 +4,8 @@
 // The MIT license requires this copyright notice to be included in all copies
 // and substantial portions of the software.
 
-const std = @import("../std.zig");
-const atomic = @import("./atomic.zig");
+const std = @import("../../std.zig");
+const atomic = @import("../atomic.zig");
 
 const builtin = std.builtin;
 const assert = std.debug.assert;
@@ -13,29 +13,35 @@ const assert = std.debug.assert;
 pub fn ParkingLot(comptime Config: type) type {
     return struct {
         // TODO: Document
-        pub const Event: type = if (@hasDecl(Config, "Event"))
+        pub const WaitEvent: type = if (@hasDecl(Config, "Event"))
             Config.Event
         else if (@hasDecl(Config, "Futex"))
-            FutexEvent(Config.Futex)
+            DefaultFutexEvent(Config.Futex)
         else
             @compileError("ParkingLot requires either an Event or Futex implementation");
 
         // TODO: Document
-        pub const Lock: type = if (@hasDecl(Config, "Lock"))
+        pub const WaitLock: type = if (@hasDecl(Config, "Lock"))
             Config.Lock
         else if (@hasDecl(Config, "Futex"))
-            FutexLock(Config.Futex)
+            DefaultFutexLock(Config.Futex)
         else
-            EventLock(Event);
+            DefaultEventLock(Event);
 
         // TODO: Document
-        pub const bucket_count: usize = if (@hasDecl(Config, "bucket_count"))
+        pub const WaitFutex: type = if (@hasDecl(Config, "Futex"))
+            Config.Futex
+        else
+            DefaultFutex(@This());
+
+        // TODO: Document
+        pub const wait_bucket_count: usize = if (@hasDecl(Config, "bucket_count"))
             Config.bucket_count
         else
             std.meta.bitCount(usize) << 2;
 
         // TODO: Document
-        pub const FairTimeout: fn() u64 = if (@hasDecl(Config, "FairTimeout"))
+        pub const WaitTimeout: type = if (@hasDecl(Config, "FairTimeout"))
             Config.FairTimeout
         else 
             struct {
@@ -92,7 +98,7 @@ pub fn ParkingLot(comptime Config: type) type {
         // TODO: Document
         pub fn park(
             address: usize,
-            cancellation: ?*Event.Cancellation,
+            cancellation: ?*WaitEvent.Cancellation,
             callback: anytype,
         ) error{ Invalidated, Cancelled }!Token {
             var node: WaitNode = undefined;
@@ -100,7 +106,7 @@ pub fn ParkingLot(comptime Config: type) type {
             {
                 // Then grab the WaitBucket lock for this address in order to
                 // prepare for an enqueue & synchronize with unpark()
-                var held: Lock.Held = undefined;
+                var held: WaitLock.Held = undefined;
                 const bucket = WaitBucket.from(address);
                 bucket.acquire(&held);
                 defer bucket.release(&held);
@@ -138,7 +144,7 @@ pub fn ParkingLot(comptime Config: type) type {
             if (cancelled) {
                 {
                     var addr: usize = undefined;
-                    var held: Lock.Held = undefined;
+                    var held: WaitLock.Held = undefined;
                     var bucket: *WaitBucket = undefined;
                     defer bucket.release(&held);
 
@@ -164,7 +170,7 @@ pub fn ParkingLot(comptime Config: type) type {
                     //
                     // This can fail if another thread manages to dequeue us before we get here.
                     // If so, we need to make sure that thread no longer has a reference to our WaitNode before we return.
-                    cancelled = WaitNode.isEnqueued(&node);
+                    cancelled = WaitQueue.isEnqueued(&node);
                     if (cancelled) {
                         _ = atomic.fetchSub(&bucket.waiters, 1, .SeqCst);
                         var queue = bucket.queue(addr);
@@ -285,7 +291,7 @@ pub fn ParkingLot(comptime Config: type) type {
             }
 
             // If waiters are discovered, grab the bucket lock in order to dequeue and wake them.
-            var held: Lock.Held = undefined;
+            var held: WaitLock.Held = undefined;
             bucket.acquire(&held);
             defer bucket.release(&held);
 
@@ -348,14 +354,14 @@ pub fn ParkingLot(comptime Config: type) type {
             }
 
             // Acquire the bucket lock for the main address.
-            var held: Lock.Held = undefined;
+            var held: WaitLock.Held = undefined;
             bucket.acquire(&held);
             defer bucket.release(&held);
 
             // Find the bucket for the requeue address and acquire its lock.
             // If the address and requeue_address map to the same bucket,
             // we don't acquire its lock as its the same above and would be UB/deadlock.
-            var requeue_held: Lock.Held = undefined;
+            var requeue_held: WaitLock.Held = undefined;
             const requeue_bucket = WaitBucket.from(requeue_address);
             if (bucket != requeue_bucket) {
                 requeue_bucket.acquire(&requeue_held);
@@ -420,8 +426,9 @@ pub fn ParkingLot(comptime Config: type) type {
             ticket: usize,
             parent: ?*WaitNode,
             children: [2]?*WaitNode,
-            xorshift: u16,
-            event: Event,
+            prng: u16,
+            token: Token,
+            event: WaitEvent,
         };
 
         const WaitList = struct {
@@ -447,7 +454,7 @@ pub fn ParkingLot(comptime Config: type) type {
         };
 
         const WaitQueue = struct {
-            bucket: *Bucket,
+            bucket: *WaitBucket,
             address: usize,
             parent: ?*WaitNode,
             head: ?*WaitNode,
@@ -599,8 +606,8 @@ pub fn ParkingLot(comptime Config: type) type {
         const WaitBucket = struct {
             root: usize = 0,
             waiters: usize = 0,
-            lock: Lock = Lock{},
-            fair_timeout: FairTimeout = FairTimeout{},
+            lock: WaitLock = WaitLock{},
+            timeout: WaitTimeout = WaitTimeout{},
 
             // WaitBucket.root tries to compress the ?*WaitNode treap root pointer and the prng state into one:
             //
@@ -612,7 +619,7 @@ pub fn ParkingLot(comptime Config: type) type {
             const ROOT_NODE_MASK = ~@as(usize, IS_ROOT_PRNG | IS_BUCKET_LOCKED);
             const PRNG_SHIFT = @popCount(std.math.Log2Int(usize), ~ROOT_NODE_MASK);
 
-            var array = [_]WaitBucket{WaitBucket{}} ** std.math.max(1, bucket_count);
+            var array = [_]WaitBucket{WaitBucket{}} ** std.math.max(1, wait_bucket_count);
 
             /// Hash an address into a WaitBucket reference.
             pub fn from(address: usize) *WaitBucket {
@@ -621,7 +628,7 @@ pub fn ParkingLot(comptime Config: type) type {
 
             /// Acquire ownership of the WaitBucket.
             /// This provides the ability to lookup the WaitQueue for an address and operate on it.
-            pub fn acquire(self: *WaitBucket, held: *Lock.Held) void {
+            pub fn acquire(self: *WaitBucket, held: *WaitLock.Held) void {
                 held.* = self.lock.acquire();
                 assert(self.root & IS_BUCKET_LOCKED == 0);
                 self.root |= IS_BUCKET_LOCKED;
@@ -629,7 +636,7 @@ pub fn ParkingLot(comptime Config: type) type {
 
             /// Release ownership of the WaitBucket after having previously acquired it.
             /// This relenquishes the safety to lookup WaitQueues on this WaitBucket or operate on existing ones.
-            pub fn release(self: *WaitBucket, held: *Lock.Held) void {
+            pub fn release(self: *WaitBucket, held: *WaitLock.Held) void {
                 assert(self.root & IS_BUCKET_LOCKED != 0);
                 self.root &= ~IS_BUCKET_LOCKED;
                 held.release();
@@ -647,7 +654,7 @@ pub fn ParkingLot(comptime Config: type) type {
                         break;
                     } else {
                         parent = node;
-                        head = node.children[@boolToInt(node_address > address)];
+                        head = node.children[@boolToInt(node.address > address)];
                     }
                 }
 
@@ -681,19 +688,19 @@ pub fn ParkingLot(comptime Config: type) type {
 
             fn getPrng(self: *WaitBucket) u16 {
                 assert(self.root & IS_BUCKET_LOCKED != 0);
-                if (self.root & IS_ROOT_PRNG != 0) {
-                    return @truncate(u16, self.root >> PRNG_SHIFT);
+                if (self.getRoot()) |root| {
+                    return root.prng;
                 } else {
-                    return @intToPtr(*WaitNode, self.root & ROOT_NODE_MASK).prng;
+                    return @truncate(u16, self.root >> PRNG_SHIFT);
                 }
             }
 
             fn setPrng(self: *WaitBucket, prng: u16) void {
                 assert(self.root & IS_BUCKET_LOCKED != 0);
-                if (self.root & IS_ROOT_PRNG != 0) {
-                    self.root = (@as(usize, prng) << PRNG_SHIFT) | IS_ROOT_PRNG | IS_BUCKET_LOCKED;
+                if (self.getRoot()) |root| {
+                    root.prng = prng;
                 } else {
-                    @intToPtr(*WaitNode, self.root & ROOT_NODE_MASK).prng = prng;
+                    self.root = (@as(usize, prng) << PRNG_SHIFT) | IS_ROOT_PRNG | IS_BUCKET_LOCKED;
                 }
             }
 
@@ -721,13 +728,235 @@ pub fn ParkingLot(comptime Config: type) type {
                 assert(self.root & IS_BUCKET_LOCKED != 0);
 
                 const fair_rng = self.genPrng(u64);
-                return self.fair_timeout.beFair(fair_rng);
+                return self.timeout.beFair(fair_rng);
             }
         };
     };
 }
 
-fn EventLock(comptime Event: type) type {
+fn DefaultFutex(comptime parking_lot: type) type {
+    return struct {
+        pub const Cancellation = parking_lot.WaitEvent.Cancellation;
+
+        pub fn wait(ptr: *const u32, expected: u32, cancellation: ?*Cancellation) error{Cancelled}!void {
+            const Parker = struct {
+                wait_ptr: *const u32,
+                wait_expected: u32,
+
+                pub fn onValidate(parker: @This()) ?parking_lot.Token {
+                    if (atomic.load(parker.wait_ptr, .SeqCst) == parker.wait_expected) {
+                        return 0;
+                    } else {
+                        return null;
+                    }
+                }
+
+                pub fn onBeforeWait(parker: @This()) void {
+                    // no-op
+                }
+
+                pub fn onCancel(parker: @This(), unparked: parking_lot.Unparked) void {
+                    // no-op
+                }
+            };
+
+            _ = parking_lot.park(
+                @ptrToInt(ptr) >> @sizeOf(@TypeOf(ptr.*)),
+                cancellation,
+                Parker{
+                    .wait_ptr = ptr,
+                    .wait_expected = expected,
+                },
+            ) catch |err| switch (err) {
+                error.Invalidated => {},
+                error.Cancelled => return error.Cancelled,
+            };
+        }
+
+        pub fn wake(ptr: *const u32) void {
+            const Unparker = struct {
+                pub fn onUnpark(unparker: @This(), unparked: parking_lot.Unparked) parking_lot.Token {
+                    return 0;
+                }
+            };
+
+            parking_lot.unparkOne(
+                @ptrToInt(ptr) >> @sizeOf(@TypeOf(ptr.*)),
+                Unparker{},
+            );
+        }
+
+        pub fn yield(iteration: usize) bool {
+            return parking_lot.WaitEvent.yield(iteration);
+        }
+    };
+}
+
+fn DefaultFutexEvent(comptime Futex: type) type {
+    return struct {
+        state: State,
+
+        const Self = @This();
+        const State = enum(u32) {
+            empty,
+            waiting,
+            notified,
+        };
+
+        pub fn init(self: *Self) void {
+            self.state = .empty;
+        }
+
+        pub fn deinit(self: *Self) void {
+            self.* = undefined;
+        }
+
+        pub fn reset(self: *Self) void {
+            self.state = .empty;
+        }
+
+        pub fn set(self: *Self) void {
+            switch (atomic.swap(&self.state, .notified, .Release)) {
+                .empty => {},
+                .waiting => Futex.wake(@ptrCast(*const u32, &self.state)),
+                .notified => unreachable,
+            }
+        }
+
+        pub const Cancellation = Futex.Cancellation;
+
+        pub fn wait(self: *Self, cancellation: ?*Cancellation) error{Cancelled}!void {
+            if (atomic.compareAndSwap(
+                &self.state,
+                .empty,
+                .waiting,
+                .Acquire,
+                .Acquire,
+            )) |state| {
+                assert(state == .notified);
+                return;
+            }
+
+            while (true) {
+                Futex.wait(
+                    @ptrCast(*const u32, &self.state),
+                    @enumToInt(State.waiting),
+                    cancellation,
+                ) catch break;
+
+                switch (atomic.load(&self.state, .Acquire)) {
+                    .empty => unreachable,
+                    .waiting => continue,
+                    .notified => return,
+                }
+            }
+
+            const state = atomic.compareAndSwap(
+                &self.state,
+                .waiting,
+                .empty,
+                .Acquire,
+                .Acquire,
+            ) orelse return error.Cancelled;
+            assert(state == .notified);
+        }
+
+        pub fn yield(iteration: usize) bool {
+            return Futex.yield(iteration);
+        }
+    };
+}
+
+fn DefaultFutexLock(comptime Futex: type) type {
+    return struct {
+        state: State = .unlocked,
+
+        const Self = @This();
+        const State = enum(u32) {
+            unlocked,
+            locked,
+            contended,
+        };
+
+        pub fn acquire(self: *Self) Held {
+            const state = atomic.swap(&self.state, .locked, .Acquire);
+            if (state != .unlocked) {
+                self.acquireSlow(state);
+            }
+
+            return Held{ .lock = self };
+        }
+
+        fn acquireSlow(self: *Self, current_state: State) void {
+            @setCold(true);
+            
+            var adaptive_spin: usize = 0;
+            var new_state = current_state;
+            var state = atomic.load(&self.state, .Relaxed);
+
+            while (true) {
+                // If the lock is unlocked, try to acquire it.
+                // If we fail, explicitely fall through to either Futex.wait() or Event.yield().
+                if (state == .unlocked) {
+                    state = atomic.compareAndSwap(
+                        &self.state,
+                        .unlocked,
+                        new_state,
+                        .Acquire,
+                        .Relaxed,
+                    ) orelse return;
+                }
+
+                if (state != .contended) {
+                    // Try to spin on the lock when it has no waiters (!= .contended).
+                    if (Futex.yield(adaptive_spin)) {
+                        adaptive_spin +%= 1;
+                        state = atomic.load(&self.state, .Relaxed);
+                        continue;
+                    }
+
+                    // If we can no longer spin, then mark that we're about to wait.
+                    new_state = .contended;
+                    if (atomic.swap(&self.state, .contended, .Acquire) == .unlocked) {
+                        return;
+                    }
+                }
+
+                // Wait on the Lock while its contended and try to acquire it again when we wake up.
+                Futex.wait(
+                    @ptrCast(*const u32, &self.state),
+                    @enumToInt(State.contended),
+                    null,
+                ) catch unreachable;
+                adaptive_spin = 0;
+                state = atomic.load(&self.state, .Relaxed);
+            }
+        }
+
+        pub const Held = struct {
+            lock: *Lock,
+
+            pub fn release(self: Held) void {
+                return self.lock.release();
+            }
+        };
+
+        fn release(self: *Self) void {
+            switch (atomic.swap(&self.state, .unlocked, .Release)) {
+                .unlocked => unreachable,
+                .locked => {},
+                .contended => self.releaseSlow(),
+            }
+        }
+
+        fn releaseSlow(self: *Self) void {
+            @setCold(true);
+            Futex.wake(@ptrCast(*const u32, &self.state));
+        }
+    };
+}
+
+fn DefaultEventLock(comptime Event: type) type {
     return extern struct {
         state: usize = UNLOCKED,
 
@@ -1008,170 +1237,6 @@ fn EventLock(comptime Event: type) type {
                     }
                 }
             }
-        }
-    };
-}
-
-fn FutexLock(comptime Futex: type) type {
-    return struct {
-        state: State = .unlocked,
-
-        const Self = @This();
-        const State = enum(u32) {
-            unlocked,
-            locked,
-            contended,
-        };
-
-        pub fn acquire(self: *Self) Held {
-            const state = atomic.swap(&self.state, .locked, .Acquire);
-            if (state != .unlocked) {
-                self.acquireSlow(state);
-            }
-
-            return Held{ .lock = self };
-        }
-
-        fn acquireSlow(self: *Self, current_state: State) void {
-            @setCold(true);
-            
-            var adaptive_spin: usize = 0;
-            var new_state = current_state;
-            var state = atomic.load(&self.state, .Relaxed);
-
-            while (true) {
-                // If the lock is unlocked, try to acquire it.
-                // If we fail, explicitely fall through to either Futex.wait() or Event.yield().
-                if (state == .unlocked) {
-                    state = atomic.compareAndSwap(
-                        &self.state,
-                        .unlocked,
-                        new_state,
-                        .Acquire,
-                        .Relaxed,
-                    ) orelse return;
-                }
-
-                if (state != .contended) {
-                    // Try to spin on the lock when it has no waiters (!= .contended).
-                    if (Futex.yield(adaptive_spin)) {
-                        adaptive_spin +%= 1;
-                        state = atomic.load(&self.state, .Relaxed);
-                        continue;
-                    }
-
-                    // If we can no longer spin, then mark that we're about to wait.
-                    new_state = .contended;
-                    if (atomic.swap(&self.state, .contended, .Acquire) == .unlocked) {
-                        return;
-                    }
-                }
-
-                // Wait on the Lock while its contended and try to acquire it again when we wake up.
-                Futex.wait(
-                    @ptrCast(*const u32, &self.state),
-                    @enumToInt(State.contended),
-                    null,
-                ) catch unreachable;
-                adaptive_spin = 0;
-                state = atomic.load(&self.state, .Relaxed);
-            }
-        }
-
-        pub const Held = struct {
-            lock: *Lock,
-
-            pub fn release(self: Held) void {
-                return self.lock.release();
-            }
-        }
-
-        fn release(self: *Self) void {
-            switch (atomic.swap(&self.state, .unlocked, .Release)) {
-                .unlocked => unreachable,
-                .locked => {},
-                .contended => self.releaseSlow(),
-            }
-        }
-
-        fn releaseSlow(self: *Self) void {
-            @setCold(true);
-            Futex.wake(@ptrCast(*const u32, &self.state));
-        }
-    };
-}
-
-fn FutexEvent(comptime Futex: type) type {
-    return struct {
-        state: State,
-
-        const Self = @This();
-        const State = enum(u32) {
-            empty,
-            waiting,
-            notified,
-        };
-
-        pub fn init(self: *Self) void {
-            self.state = .empty;
-        }
-
-        pub fn deinit(self: *Self) void {
-            self.* = undefined;
-        }
-
-        pub fn reset(self: *Self) void {
-            self.state = .empty;
-        }
-
-        pub fn set(self: *Self) void {
-            switch (atomic.swap(&self.state, .notified, .Release)) {
-                .empty => {},
-                .waiting => Futex.wake(@ptrCast(*const u32, &self.state)),
-                .notified => unreachable;
-            }
-        }
-
-        pub const Cancellation = Futex.Cancellation;
-
-        pub fn wait(self: *Self, cancellation: ?*Cancellation) error{Cancelled}!void {
-            if (atomic.compareAndSwap(
-                &self.state,
-                .empty,
-                .waiting,
-                .Acquire,
-                .Acquire,
-            )) |state| {
-                assert(state == .notified);
-                return;
-            }
-
-            while (true) {
-                Futex.wait(
-                    @ptrCast(*const u32, &self.state),
-                    @enumToInt(State.waiting),
-                    cancellation,
-                ) catch break;
-
-                switch (atomic.load(&self.state, .Acquire)) {
-                    .empty => unreachable,
-                    .waiting => continue,
-                    .notified => return,
-                }
-            }
-
-            const state = atomic.compareAndSwap(
-                &self.state,
-                .waiting,
-                .empty,
-                .Acquire,
-                .Acquire,
-            ) orelse return error.Cancelled;
-            assert(state == .notified);
-        }
-
-        pub fn yield(iteration: usize) bool {
-            return Futex.yield(iteration);
         }
     };
 }

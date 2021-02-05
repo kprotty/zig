@@ -646,11 +646,12 @@ const WindowsParkingLot = ParkingLot(struct {
 
             var timed_out = false;
             var timeout: ?u64 = null;
-
             if (cancellation) |cc| {
-                timeout = cc.nanoseconds() orelse {
+                if (cc.nanoseconds()) |timeout_ns| {
+                    timeout = timeout_ns;
+                } else {
                     timed_out = true;
-                };
+                }
             }
 
             if (!timed_out) {
@@ -674,7 +675,7 @@ const WindowsParkingLot = ParkingLot(struct {
                     .empty,
                     .Acquire,
                     .Acquire,
-                ) orelse return error.TimedOut;
+                ) orelse return error.Cancelled;
                 assert(state == .notified);
                 NtKeyedEvent.wait(
                     @ptrCast(*const u32, &self.state),
@@ -846,7 +847,7 @@ const SystemCancellation = union(enum) {
 
     fn nanoseconds(self: *SystemCancellation) ?u64 {
         const now = std.time.now();
-        switch (self) {
+        switch (self.*) {
             .Duration => |duration| {
                 self.* = .{ .Deadline = now + duration };
                 return duration;

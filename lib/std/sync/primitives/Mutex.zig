@@ -4,8 +4,8 @@
 // The MIT license requires this copyright notice to be included in all copies
 // and substantial portions of the software.
 
-const std = @import("../std.zig");
-const atomic = @import("./atomic.zig");
+const std = @import("../../std.zig");
+const atomic = @import("../atomic.zig");
 
 const builtin = std.builtin;
 const helgrind: ?type = if (builtin.valgrind_support) std.valgrind.helgrind else null;
@@ -23,7 +23,7 @@ pub fn Mutex(comptime parking_lot: type) type {
 
         const Self = @This();
 
-        pub const Cancellation = parking_lot.Event.Cancellation;
+        pub const Cancellation = parking_lot.WaitEvent.Cancellation;
 
         pub fn tryAcquire(self: *Self) ?Held {
             const acquired = switch (builtin.arch) {
@@ -62,11 +62,11 @@ pub fn Mutex(comptime parking_lot: type) type {
             return self.acquireFast(null) catch unreachable;
         }
 
-        pub inline fn acquireWith(self: *Self, cancellation: Cancellation) error{Cancelled}!void {
+        pub inline fn acquireWith(self: *Self, cancellation: Cancellation) error{Cancelled}!Held {
             return self.acquireFast(cancellation);
         }
 
-        fn acquireFast(self: *Self, cancellation: ?Cancellation) error{Cancelled}!void {
+        fn acquireFast(self: *Self, cancellation: ?Cancellation) error{Cancelled}!Held {
             const acquired = switch (builtin.arch) {
                 .i386, .x86_64 => atomic.bitSet(
                     &self.state,
@@ -83,7 +83,7 @@ pub fn Mutex(comptime parking_lot: type) type {
             };
 
             if (!acquired) {
-                self.acquireSlow(cancellation);
+                try self.acquireSlow(cancellation);
             }
 
             if (helgrind) |hg| {
@@ -110,7 +110,7 @@ pub fn Mutex(comptime parking_lot: type) type {
                         .Relaxed,
                     ) orelse return;
                     
-                    if (parking_lot.Event.yield(adaptive_spin)) {
+                    if (parking_lot.WaitEvent.yield(adaptive_spin)) {
                         adaptive_spin +%= 1;
                     } else {
                         atomic.spinLoopHint();
@@ -120,7 +120,7 @@ pub fn Mutex(comptime parking_lot: type) type {
                 }
 
                 if (state & PARKED == 0) {
-                    if (parking_lot.Event.yield(adaptive_spin)) {
+                    if (parking_lot.WaitEvent.yield(adaptive_spin)) {
                         adaptive_spin +%= 1;
                         state = atomic.load(&self.state, .Relaxed);
                         continue;
@@ -171,12 +171,13 @@ pub fn Mutex(comptime parking_lot: type) type {
                 };
 
                 switch (unpark_token) {
-                    TOKEN_ACQUIRE => return,
                     TOKEN_RETRY => {
                         adaptive_spin = 0;
                         state = atomic.load(&self.state, .Relaxed);
                         continue;
                     },
+                    TOKEN_ACQUIRE => return,
+                    else => unreachable,
                 }
             }
         }
@@ -213,8 +214,8 @@ pub fn Mutex(comptime parking_lot: type) type {
                 be_fair: bool,
 
                 pub fn onUnpark(unparker: @This(), unparked: parking_lot.Unparked) parking_lot.Token {
-                    const mutex = unparked.mutex;
-                    const be_fair = unparker.be_fair or unparked.timestamp_expired;
+                    const mutex = unparker.mutex;
+                    const be_fair = unparker.be_fair or unparked.be_fair;
                     
                     if (unparked.token != null and be_fair) {
                         if (!unparked.has_more) {
