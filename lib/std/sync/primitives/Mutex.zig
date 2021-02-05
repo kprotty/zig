@@ -102,20 +102,14 @@ pub fn Mutex(comptime parking_lot: type) type {
 
             while (true) {
                 if (state & LOCKED == 0) {
-                    _ = atomic.tryCompareAndSwap(
+                    state = atomic.tryCompareAndSwap(
                         &self.state,
                         state,
                         state | LOCKED,
                         .Acquire,
                         .Relaxed,
                     ) orelse return;
-                    
-                    if (parking_lot.WaitEvent.yield(adaptive_spin)) {
-                        adaptive_spin +%= 1;
-                    } else {
-                        atomic.spinLoopHint();
-                    }
-                    state = atomic.load(&self.state, .Relaxed);
+                    atomic.spinLoopHint();
                     continue;
                 }
 
@@ -195,6 +189,10 @@ pub fn Mutex(comptime parking_lot: type) type {
         };
 
         fn releaseFast(self: *Self, force_fair: bool) void {
+            if (helgrind) |hg| {
+                hg.annotateHappensBefore(@ptrToInt(self));
+            }
+
             if (atomic.compareAndSwap(
                 &self.state,
                 LOCKED,

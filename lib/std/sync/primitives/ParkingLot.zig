@@ -9,6 +9,7 @@ const atomic = @import("../atomic.zig");
 
 const builtin = std.builtin;
 const assert = std.debug.assert;
+const helgrind: ?type = if (builtin.valgrind_support) std.valgrind.helgrind else null;
 
 pub fn ParkingLot(comptime Config: type) type {
     return struct {
@@ -837,93 +838,10 @@ fn DefaultFutexEvent(comptime Futex: type) type {
     };
 }
 
-fn DefaultFutexLock(comptime Futex: type) type {
-    return struct {
-        state: State = .unlocked,
-
-        const Self = @This();
-        const State = enum(u32) {
-            unlocked,
-            locked,
-            contended,
-        };
-
-        pub fn acquire(self: *Self) Held {
-            const state = atomic.swap(&self.state, .locked, .Acquire);
-            if (state != .unlocked) {
-                self.acquireSlow(state);
-            }
-
-            return Held{ .lock = self };
-        }
-
-        fn acquireSlow(self: *Self, current_state: State) void {
-            @setCold(true);
-            
-            var adaptive_spin: usize = 0;
-            var new_state = current_state;
-            var state = atomic.load(&self.state, .Relaxed);
-
-            while (true) {
-                // If the lock is unlocked, try to acquire it.
-                // If we fail, explicitely fall through to either Futex.wait() or Event.yield().
-                if (state == .unlocked) {
-                    state = atomic.compareAndSwap(
-                        &self.state,
-                        .unlocked,
-                        new_state,
-                        .Acquire,
-                        .Relaxed,
-                    ) orelse return;
-                }
-
-                if (state != .contended) {
-                    // Try to spin on the lock when it has no waiters (!= .contended).
-                    if (Futex.yield(adaptive_spin)) {
-                        adaptive_spin +%= 1;
-                        state = atomic.load(&self.state, .Relaxed);
-                        continue;
-                    }
-
-                    // If we can no longer spin, then mark that we're about to wait.
-                    new_state = .contended;
-                    if (atomic.swap(&self.state, .contended, .Acquire) == .unlocked) {
-                        return;
-                    }
-                }
-
-                // Wait on the Lock while its contended and try to acquire it again when we wake up.
-                Futex.wait(
-                    @ptrCast(*const u32, &self.state),
-                    @enumToInt(State.contended),
-                    null,
-                ) catch unreachable;
-                adaptive_spin = 0;
-                state = atomic.load(&self.state, .Relaxed);
-            }
-        }
-
-        pub const Held = struct {
-            lock: *Lock,
-
-            pub fn release(self: Held) void {
-                return self.lock.release();
-            }
-        };
-
-        fn release(self: *Self) void {
-            switch (atomic.swap(&self.state, .unlocked, .Release)) {
-                .unlocked => unreachable,
-                .locked => {},
-                .contended => self.releaseSlow(),
-            }
-        }
-
-        fn releaseSlow(self: *Self) void {
-            @setCold(true);
-            Futex.wake(@ptrCast(*const u32, &self.state));
-        }
-    };
+fn DefaultFutexLock(comptime FutexImpl: type) type {
+    return @import("./Lock.zig").Lock(struct {
+        pub const Futex = FutexImpl;
+    });
 }
 
 fn DefaultEventLock(comptime Event: type) type {

@@ -386,6 +386,8 @@ const PosixParkingLot = ParkingLot(struct {
 });
 
 const WindowsParkingLot = ParkingLot(struct {
+    const windows = std.os.windows;
+
     /// Same size as windows.PEB.WaitOnAddressHashTable
     pub const bucket_count = 128; 
 
@@ -433,7 +435,32 @@ const WindowsParkingLot = ParkingLot(struct {
     };
 
     /// ParkingLot.Lock implementation backed by NtKeyedEvents.
-    pub const Lock = struct {
+    pub const Lock = if (SRWLock.is_supported)
+        SRWLock
+    else 
+        NtLock;
+    
+    const SRWLock = struct {
+        srwlock: windows.SRWLOCK = windows.SRWLOCK_INIT,
+
+        const Self = @This();
+        const is_supported = std.Target.current.os.version_range.windows.isAtLeast(.vista) orelse false;
+
+        pub fn acquire(self: *SRWLock) Held {
+            windows.kernel32.AcquireSRWLockExclusive(&self.srwlock);
+            return Held{ .psrwlock = &self.srwlock };
+        }
+
+        pub const Held = struct {
+            psrwlock: *windows.SRWLOCK,
+
+            pub fn release(self: Held) void {
+                windows.kernel32.ReleaseSRWLockExclusive(self.psrwlock);
+            }
+        };
+    };
+
+    const NtLock = struct {
         state: u32 = UNLOCKED,
 
         const UNLOCKED = 0;
@@ -599,7 +626,8 @@ const WindowsParkingLot = ParkingLot(struct {
     };
 
     /// ParkingLot.Event implementation backed by NtKeyedEvents
-    pub const Event = struct {
+    pub const Event = NtEvent;
+    const NtEvent = struct {
         state: State,
 
         const Self = @This();
@@ -691,9 +719,22 @@ const WindowsParkingLot = ParkingLot(struct {
 
     /// Windows NT Keyed Events API
     const NtKeyedEvent = struct {
-        const windows = std.os.windows;
-
         pub fn yield(iter: ?usize) bool {
+            // Give up our thread quota if this is a contended yield
+            const iteration = iter orelse {
+                _ = windows.kernel32.Sleep(0);
+                return false;
+            };
+
+            if (iteration < 4000) {
+                atomic.spinLoopHint();
+                return true;
+            }
+
+            return false;
+        }
+
+        pub fn _yield(iter: ?usize) bool {
             // Give up our thread quota if this is a contended yield
             const iteration = iter orelse {
                 _ = windows.kernel32.Sleep(0);

@@ -4,12 +4,14 @@
 // The MIT license requires this copyright notice to be included in all copies
 // and substantial portions of the software.
 
+const _lock = @import("./primitives/Lock.zig");
 const _mutex = @import("./primitives/Mutex.zig");
 const _once = @import("./primitives/Once.zig");
 const _parking_lot = @import("./primitives/ParkingLot.zig");
 const _reset_event = @import("./primitives/ResetEvent.zig");
 
 pub const core = struct {
+    pub const Lock = _lock.Lock;
     pub const Mutex = _mutex.Mutex;
     pub const Once = _once.Once;
     pub const ParkingLot = _parking_lot.ParkingLot;
@@ -17,6 +19,7 @@ pub const core = struct {
 };
 
 pub const serial = struct {
+    pub const Lock = _lock.SerialLock;
     pub const Mutex = _mutex.SerialMutex;
     pub const Once = _once.SerialOnce;
     pub const ParkingLot = _parking_lot.SerialParkingLot;
@@ -31,6 +34,7 @@ pub fn with(comptime parking_lot_backend: type) type {
     return struct {
         pub const parking_lot = parking_lot_backend;
         
+        pub const Lock = core.Lock(parking_lot);
         pub const Mutex = core.Mutex(parking_lot);
         pub const Once = core.Once(parking_lot);
         pub const ResetEvent = core.ResetEvent(parking_lot);
