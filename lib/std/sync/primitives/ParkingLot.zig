@@ -27,7 +27,7 @@ pub fn ParkingLot(comptime Config: type) type {
         else if (@hasDecl(Config, "Futex"))
             DefaultFutexLock(Config.Futex)
         else
-            DefaultEventLock(Event);
+            DefaultEventLock(WaitEvent);
 
         // TODO: Document
         pub const WaitFutex: type = if (@hasDecl(Config, "Futex"))
@@ -838,9 +838,9 @@ fn DefaultFutexEvent(comptime Futex: type) type {
     };
 }
 
-fn DefaultFutexLock(comptime FutexImpl: type) type {
+fn DefaultFutexLock(comptime Futex: type) type {
     return @import("./Lock.zig").Lock(struct {
-        pub const Futex = FutexImpl;
+        pub const WaitFutex = Futex;
     });
 }
 
@@ -977,7 +977,7 @@ fn DefaultEventLock(comptime Event: type) type {
 
                 // The waiter is now in the wait queue.
                 // Wait for a wakeup from a release() thread.
-                waiter.event.wait();
+                waiter.event.wait(null) catch unreachable;
 
                 // Now that we've woken up, reset our state and try to acquire the lock again.
                 adaptive_spin = 0;

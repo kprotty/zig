@@ -37,7 +37,7 @@ const UnknownOsParkingLot = ParkingLot(struct {
                     if (cancellation) |cc| {
                         break :blk (cc.nanoseconds() orelse return error.Cancelled);
                     } else {
-                        break :blk (10 * std.time.ns_per_ms);
+                        break :blk (1 * std.time.ns_per_ms);
                     }
                 });
             }
@@ -116,7 +116,7 @@ const LinuxParkingLot = ParkingLot(struct {
         pub fn yield(iteration: usize) bool {
             // Don't spin on low-power devices as the latency there is not worth the power draw
             const target = std.Target.current;
-            if (comptime target.isAndroid() or target.arch.isMIPS()) {
+            if (comptime target.cpu.arch.isARM() or target.cpu.arch.isMIPS()) {
                 return false;
             }
 
@@ -385,26 +385,33 @@ const PosixParkingLot = ParkingLot(struct {
     };
 });
 
-const WindowsParkingLot = ParkingLot(struct {
+const WindowsParkingLot = struct {
     const windows = std.os.windows;
 
+    pub usingnamespace ParkingLot(struct {
+        pub const bucket_count = NT_BUCKET_COUNT;
+        pub const FairTimeout = NtTimeout;
+        pub const Lock = NtLock;
+        pub const Event = NtEvent;
+    });
+
     /// Same size as windows.PEB.WaitOnAddressHashTable
-    pub const bucket_count = 128; 
+    const NT_BUCKET_COUNT = 128; 
 
     /// Custom FairTimeout implementation which is less precise than SystemTimeout but faster to query.
-    pub const FairTimeout = struct {
+    const NtTimeout = struct {
         interrupt_time_100ns: u64 = 0,
 
         pub fn beFair(self: *@This(), fair_rng: u64) bool {
             const now = queryInterruptTime();
-            if (now < self.interrupt_time_100ns) {
+            if (now <= self.interrupt_time_100ns) {
                 return false;
             }
 
             // Set the next expiry on the next KUSER_SHARED_DATA interrupt.
             // The interrupt has a granularity of 1ms to ~16ms depending on timeBeginPeriod/timeEndPeriod
-            // which binds eventual fairness to the frequency of the system instead of the arbitrary 1ms.
-            self.interrupt_time_100ns = now + 1;
+            // which binds eventual fairness to the frequency of the system instead of the fixed 1ms.
+            self.interrupt_time_100ns = now;
             return true;
         }
 
@@ -434,199 +441,10 @@ const WindowsParkingLot = ParkingLot(struct {
         }
     };
 
-    /// ParkingLot.Lock implementation backed by NtKeyedEvents.
-    pub const Lock = if (SRWLock.is_supported)
-        SRWLock
-    else 
-        NtLock;
-    
-    const SRWLock = struct {
-        srwlock: windows.SRWLOCK = windows.SRWLOCK_INIT,
-
-        const Self = @This();
-        const is_supported = std.Target.current.os.version_range.windows.isAtLeast(.vista) orelse false;
-
-        pub fn acquire(self: *SRWLock) Held {
-            windows.kernel32.AcquireSRWLockExclusive(&self.srwlock);
-            return Held{ .psrwlock = &self.srwlock };
-        }
-
-        pub const Held = struct {
-            psrwlock: *windows.SRWLOCK,
-
-            pub fn release(self: Held) void {
-                windows.kernel32.ReleaseSRWLockExclusive(self.psrwlock);
-            }
-        };
-    };
-
-    const NtLock = struct {
-        state: u32 = UNLOCKED,
-
-        const UNLOCKED = 0;
-        const LOCKED = 1;
-        const WAKING = 1 << 8;
-        const WAITING = 1 << 9;
-
-        const Self = @This();
-
-        pub fn acquire(self: *Self) Held {
-            // Fast-path acquire the lock (is most times inlined)
-            const acquired = switch (builtin.arch) {
-                // On x86, use "lock bts" since it has a smaller icache footprint.
-                .i386, .x86_64 => atomic.bitSet(
-                    &self.state,
-                    @ctz(std.math.Log2Int(u32), LOCKED),
-                    .Acquire,
-                ) == 0,
-                // On other architectures (currently only arm/aarch64) use weak CAS instead.
-                // This is used over atomic.swap() to avoid doing a store() if contended
-                // while spurious failure is handled by acquireSlow() below.
-                else => atomic.tryCompareAndSwap(
-                    @ptrCast(*u8, &self.state),
-                    UNLOCKED,
-                    LOCKED,
-                    .Acquire,
-                    .Relaxed,
-                ) == null,
-            };
-
-            if (!acquired) {
-                self.acquireSlow();
-            }
-
-            return Held{ .lock = self };
-        }
-
-        fn acquireSlow(self: *Self) void {
-            @setCold(true);
-
-            var adaptive_spin: usize = 0;
-            var state = atomic.load(&self.state, .Relaxed);
-            while (true) {
-                // If the lock is currently not held, try to acquire it.
-                if (state & LOCKED == 0) {
-                    const acquired = switch (builtin.arch) {
-                        // On x86, use swap() instead of bitSet() or CAS as its faster under contention.
-                        .i386, .x86_64 => atomic.swap(
-                            @ptrCast(*u8, &self.state),
-                            LOCKED,
-                            .Acquire,
-                        ) == UNLOCKED,
-                        // On other archs (currently arm/aarch64) use a normal CAS instead of swap (see acquire()).
-                        else => atomic.compareAndSwap(
-                            @ptrCast(*u8, &self.state),
-                            UNLOCKED,
-                            LOCKED,
-                            .Acquire,
-                            .Relaxed,
-                        ) == null,
-                    };
-
-                    if (acquired) {
-                        return;
-                    }
-
-                    // If we failed to acquire the lock, this implies there is contention.
-                    // If so, give up our thread's time quota to reschedule and try again.
-                    // This serves to decrease atomic contention when dozens of threads are fighting for the lock.
-                    _ = NtKeyedEvent.yield(null);
-                    state = atomic.load(&self.state, .Relaxed);
-                    continue;
-                }
-
-                // If there are no waiting threads, try to spin a bit in hopes that the lock becomes unlocked.
-                // Spinning instead of immediately sleeping helps in micro-contention cases when the lock is only
-                // held for a small amount of time to avoid a syscall below.
-                if ((state < WAITING) and NtKeyedEvent.yield(adaptive_spin)) {
-                    adaptive_spin += 1;
-                    state = atomic.load(&self.state, .Relaxed);
-                    continue;
-                }
-
-                // Prepare our thread to wait by adding a waiter to the state.
-                var new_state: u32 = undefined;
-                if (@addWithOverflow(u32, state, WAITING, &new_state)) {
-                    std.debug.panic("Too many waiters on a given NtLock", .{});
-                }
-
-                // Once we register our thread for waiting, then sleep using NtKeyedEvent.
-                // A thread waking us up removes our WAITER from the state and sets the WAKING bit.
-                // Upon waking, we unset the WAKING bit in order to allow another thread to wakeup.
-                // This results in avoiding multiple threads waking up to compete on the lock and also backpressures syscalls.
-                state = atomic.tryCompareAndSwap(
-                    &self.state,
-                    state,
-                    new_state,
-                    .Relaxed,
-                    .Relaxed,
-                ) orelse blk: {
-                    adaptive_spin = 0;
-                    NtKeyedEvent.wait(&self.state, null) catch unreachable;
-                    break :blk (atomic.fetchSub(&self.state, WAKING, .Relaxed) - WAKING);
-                };
-            }
-        }
-
-        pub const Held = struct {
-            lock: *Self,
-
-            pub fn release(self: Held) void {
-                self.lock.release();
-            }
-        };
-
-        fn release(self: *Self) void {
-            // We unlock the Lock by zeroing out the LOCKED bit.
-            // The LOCKED bit has its own byte which allows us to use a store() instead of RMW op.
-            // The former is overall faster than the latter as LL/SC loops or bus-locked instructions are avoided.
-            atomic.store(
-                @ptrCast(*u8, &self.state),
-                UNLOCKED,
-                .Release,
-            );
-
-            // After unlocking, we need to see if we can wake up another thread to acquire the Lock.
-            // We only attempt if there's any WAITERs and if theres not already a thread waking up (WAKING).
-            // We also don't attempt to wake if the Lock was already acquired, as that thread will do the wakeup instead on next release().
-            const state = atomic.load(&self.state, .Relaxed);
-            if ((state >= WAITING) and (state & (LOCKED | WAKING) == 0)) {
-                self.releaseSlow();
-            }
-        }
-
-        fn releaseSlow(self: *Self) void {
-            @setCold(true);
-
-            var state = atomic.load(&self.state, .Relaxed);
-            while (true) {
-                // Don't try to perform a wake up if:
-                // - there are no threads waiting
-                // - there's already a thread waking up
-                // - the lock is currently acquired (that thread will do the wake up instead).
-                if ((state < WAITING) or (state & (LOCKED | WAKING) != 0)) {
-                    return;
-                }
-
-                // To wake up a waiter, we decrement one WAITER and set the WAKING bit.
-                // This marks the waiting thread as "woken up" and prevents other waiting threads
-                // from waking up until this one wakes up and unsets the WAKING bit.
-                state = atomic.tryCompareAndSwap(
-                    &self.state,
-                    state,
-                    (state - WAITING) | WAKING,
-                    .Relaxed,
-                    .Relaxed,
-                ) orelse {
-                    NtKeyedEvent.wake(&self.state);
-                    return;
-                };
-            }
-        }
-    };
+    /// ParkingLot.Lock implementation backed by this ParkingLot implementation which is backend by NtKeyedEvents
+    const NtLock = @import("../primitives/Lock.zig").Lock(@This());
 
     /// ParkingLot.Event implementation backed by NtKeyedEvents
-    pub const Event = NtEvent;
     const NtEvent = struct {
         state: State,
 
@@ -713,19 +531,8 @@ const WindowsParkingLot = ParkingLot(struct {
         }
 
         pub fn yield(iteration: usize) bool {
-            return NtKeyedEvent.yield(iteration);
-        }
-    };
-
-    /// Windows NT Keyed Events API
-    const NtKeyedEvent = struct {
-        pub fn yield(iter: ?usize) bool {
-            // Give up our thread quota if this is a contended yield
-            const iteration = iter orelse {
-                _ = windows.kernel32.Sleep(0);
-                return false;
-            };
-
+            // Uses a similar spinning strategy to the one found in kernel32's CRITICAL_SECTION.
+            // https://docs.microsoft.com/en-us/windows/win32/api/synchapi/nf-synchapi-initializecriticalsectionandspincount
             if (iteration < 4000) {
                 atomic.spinLoopHint();
                 return true;
@@ -733,36 +540,10 @@ const WindowsParkingLot = ParkingLot(struct {
 
             return false;
         }
+    };
 
-        pub fn _yield(iter: ?usize) bool {
-            // Give up our thread quota if this is a contended yield
-            const iteration = iter orelse {
-                _ = windows.kernel32.Sleep(0);
-                return false;
-            };
-
-            // Uses an adaptive spinning strategy where the spin count is based on kernel32's CRITICAL_SECTION.
-            // https://docs.microsoft.com/en-us/windows/win32/api/synchapi/nf-synchapi-initializecriticalsectionandspincount
-            const max_iteration = 4000;
-            if (iteration >= max_iteration) {
-                return false;
-            }
-
-            // adaptive yielding:
-            // - yield hardware thread (hyperthreading)
-            // - yield OS thread to another running on same core
-            // - yield OS thread to another running anywhere in system
-            if (iteration < max_iteration - 20) {
-                atomic.spinLoopHint();
-            } else if (iteration < max_iteration - 10) {
-                _ = windows.kernel32.SwitchToThread();
-            } else {
-                windows.kernel32.Sleep(0);
-            }
-
-            return true;
-        }
-
+    /// Windows NT Keyed Events API
+    const NtKeyedEvent = struct {
         /// Wait on a wake() notification for a key using NtKeyedEvents.
         pub fn wait(key: *const u32, timeout: ?u64) error{TimedOut}!void {
             var timeout_value: windows.LARGE_INTEGER = undefined;
@@ -859,7 +640,7 @@ const WindowsParkingLot = ParkingLot(struct {
             return updated_handle;
         }
     };
-});
+};
 
 /// A ParkingLot FairTimeout which expires around every 1ms according to the system
 const SystemTimeout = struct {
@@ -868,7 +649,7 @@ const SystemTimeout = struct {
     pub fn beFair(self: *SystemTimeout, fair_rng: u64) bool {
         // Use std.time.Clock.Precise instead of std.time.now() 
         // since we don't really need the monotonic property here.
-        const now = std.time.Clock.Precide.read() orelse 0;
+        const now = std.time.Clock.Precise.read() orelse 0;
         if (now < self.expires) {
             return false;
         }
