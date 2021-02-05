@@ -111,17 +111,8 @@ pub fn ParkingLot(comptime Config: type) type {
                 bucket.acquire(&held);
                 defer bucket.release(&held);
 
-                // Update the wait count for the bucket before calling the onValidate() function below.
-                // If done after, then an unpark() thread could see waiters = 0,
-                // after we validate the wait but before enqueue to wait,
-                // causing this waiter to miss an unpark() notification.
-                _ = atomic.fetchAdd(&bucket.waiters, 1, .SeqCst);
-
                 // Call the `onValidate()` callback which double checks that the caller should actually wait.
-                // If it returns null, then it should not wait so it reverts any changes made so far in preparation.
-                // If it returns a Token, the Token is used for the duration of the wait to tag the Waiter for the unpark() threads.
                 node.token = callback.onValidate() orelse {
-                    _ = atomic.fetchSub(&bucket.waiters, 1, .SeqCst);
                     return error.Invalidated;
                 };
 
@@ -158,7 +149,7 @@ pub fn ParkingLot(comptime Config: type) type {
                         addr = atomic.load(&node.address, .Relaxed);
                         bucket = WaitBucket.from(addr);
                         bucket.acquire(&held);
-                        if (node.address == addr) {
+                        if (atomic.load(&node.address, .Relaxed) == addr) {
                             break;
                         } else {
                             bucket.release(&held);
@@ -172,10 +163,8 @@ pub fn ParkingLot(comptime Config: type) type {
                     // If so, we need to make sure that thread no longer has a reference to our WaitNode before we return.
                     cancelled = WaitQueue.isEnqueued(&node);
                     if (cancelled) {
-                        _ = atomic.fetchSub(&bucket.waiters, 1, .SeqCst);
                         var queue = bucket.queue(addr);
                         queue.remove(&node);
-
                         callback.onCancel(Unparked{
                             .token = node.token,
                             .has_more = !queue.isEmpty(),
@@ -252,7 +241,7 @@ pub fn ParkingLot(comptime Config: type) type {
                 }
 
                 pub fn onBeforeWake(self: @This()) void {
-                    if (self.called_unparked) {
+                    if (!self.called_unparked) {
                         _ = self.callback.onUnpark(Unparked{});
                     }
                 }
@@ -284,13 +273,8 @@ pub fn ParkingLot(comptime Config: type) type {
                 node.event.set();
             };
 
-            // Find the bucket for this address and bail if it has no waiters.
+            // Grab the bucket lock in order to dequeue and wake them.
             const bucket = WaitBucket.from(address);
-            if (atomic.load(&bucket.waiters, .SeqCst) == 0) {
-                return;
-            }
-
-            // If waiters are discovered, grab the bucket lock in order to dequeue and wake them.
             var held: WaitLock.Held = undefined;
             bucket.acquire(&held);
             defer bucket.release(&held);
@@ -309,15 +293,11 @@ pub fn ParkingLot(comptime Config: type) type {
                     .Stop => break,
                     .Skip => continue,
                     .Unpark => |unpark_token| {
-                        node.token = unpark_token;
+                        queue.remove(node);
                         unparked.push(node);
+                        node.token = unpark_token;
                     },
                 }
-            }
-
-            // If any we're unparked, update the waiter count to reflect this.
-            if (unparked.len > 0) {
-                _ = atomic.fetchSub(&bucket.waiters, unparked.len, .SeqCst);
             }
 
             // Before we wake up the waiters,
@@ -347,13 +327,8 @@ pub fn ParkingLot(comptime Config: type) type {
                 node.event.set();
             };
 
-            // Find the bucket for the address and bail if there's nothing to unpark/requeue.
-            const bucket = WaitBucket.from(address);
-            if (atomic.load(&bucket.waiters, .SeqCst) == 0) {
-                return;
-            }
-
             // Acquire the bucket lock for the main address.
+            const bucket = WaitBucket.from(address);
             var held: WaitLock.Held = undefined;
             bucket.acquire(&held);
             defer bucket.release(&held);
@@ -399,16 +374,6 @@ pub fn ParkingLot(comptime Config: type) type {
                 }
             }
 
-            // Update the waiter counts for the buckets are moving WaitNodes around.
-            // If the address and requeue_address point to the same bucket,
-            // we only need to subtract those which were unparked as the requeued are still waiting.
-            if (bucket != requeue_bucket and requeued > 0) {
-                _ = atomic.fetchSub(&bucket.waiters, unparked.len + requeued, .SeqCst);
-                _ = atomic.fetchAdd(&requeue_bucket.waiters, requeued, .SeqCst);
-            } else if (unparked.len > 0) {
-                _ = atomic.fetchSub(&bucket.waiters, unparked.len, .SeqCst);
-            }
-
             // After performing the unpark/requeued,
             // invoke the onBeforeWake() while the locks are held
             // passing in how many WaitNodes were actually unparked and requeued.
@@ -437,17 +402,17 @@ pub fn ParkingLot(comptime Config: type) type {
             len: usize = 0,
 
             pub fn push(self: *WaitList, node: *WaitNode) void {
+                node.next = null;
                 if (self.head == null) self.head = node;
                 if (self.tail) |tail| tail.next = node;
                 self.tail = node;
                 self.len += 1;
-                node.next = null;
             }
 
             pub fn pop(self: *WaitList) ?*WaitNode {
                 const node = self.head orelse return null;
-                if (node.next == null) self.tail = null;
                 self.head = node.next;
+                if (self.head == null) self.tail = null;
                 self.len -= 1;
                 return node;
             }
@@ -507,11 +472,14 @@ pub fn ParkingLot(comptime Config: type) type {
                 node.children = [_]?*WaitNode{ null, null };
                 node.ticket = self.bucket.genPrng(u16) | 1;
 
-                // Insert the node into the tree and re-balance it by ticket.
+                // Insert the node into the tree
                 self.head = node;
-                self.updateParent(node, node);
+                self.updateParent(node, null, node);
+
+                // Re-balance the tree by ticket
                 while (node.parent) |parent| {
                     if (parent.ticket <= node.ticket) break;
+                    assert(parent.children[0] == node or parent.children[1] == node);
                     self.rotate(parent, parent.children[0] != node);
                 }
             }
@@ -539,7 +507,9 @@ pub fn ParkingLot(comptime Config: type) type {
 
                 // If we're the head and theres more nodes, we need to update the head.
                 // If we're the head and we're the last node, we need to remove ourselves from the tree.
-                if (node.next) |new_head| {
+                const new_head_node = node.next;
+                if (new_head_node) |new_head| {
+                    new_head.tail = head.tail;
                     new_head.ticket = head.ticket;
                     new_head.parent = head.parent;
                     new_head.children = head.children;
@@ -558,16 +528,17 @@ pub fn ParkingLot(comptime Config: type) type {
                     }
                 }
 
-                self.head = node.next;
-                self.updateParent(node, node.next);
+                self.head = new_head_node;
+                self.updateParent(node, node, new_head_node);
             }
 
             /// Update the parent of the `node` to point to `new_node`.
-            /// `new_node` may alias with `node` (e.g. for insertion).
-            fn updateParent(self: *WaitQueue, node: *WaitNode, new_node: ?*WaitNode) void {
+            /// `new_node` and/or `old_node` may alias with `node`.
+            fn updateParent(self: *WaitQueue, node: *WaitNode, old_node: ?*WaitNode, new_node: ?*WaitNode) void {
                 if (node.parent) |parent| {
-                    const parent_addr = parent.address;
-                    parent.children[@boolToInt(parent_addr > self.address)] = new_node;
+                    const ptr = &parent.children[@boolToInt(self.address > parent.address)];
+                    assert(ptr.* == old_node);
+                    ptr.* = new_node;
                 } else {
                     self.bucket.setRoot(new_node);
                 }
@@ -605,7 +576,6 @@ pub fn ParkingLot(comptime Config: type) type {
         /// Each address maps to a given WaitBucket where it can enqueue itself to Wait.
         const WaitBucket = struct {
             root: usize = 0,
-            waiters: usize = 0,
             lock: WaitLock = WaitLock{},
             timeout: WaitTimeout = WaitTimeout{},
 
@@ -654,7 +624,7 @@ pub fn ParkingLot(comptime Config: type) type {
                         break;
                     } else {
                         parent = node;
-                        head = node.children[@boolToInt(node.address > address)];
+                        head = node.children[@boolToInt(address > node.address)];
                     }
                 }
 
