@@ -5,7 +5,7 @@
 // and substantial portions of the software.
 
 const atomic = @import("../atomic.zig");
-const ParkingLot = @import("../primitives.zig").core.ParkingLot;
+const ParkingLot = @import("./ParkingLot.zig").ParkingLot;
 
 pub usingnamespace ParkingLot(struct {
     pub const Futex = struct {

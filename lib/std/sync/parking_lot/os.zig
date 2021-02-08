@@ -6,7 +6,7 @@
 
 const std = @import("../../std.zig");
 const atomic = @import("../atomic.zig");
-const ParkingLot = @import("../primitives.zig").core.ParkingLot;
+const ParkingLot = @import("./ParkingLot.zig").ParkingLot;
 
 const builtin = std.builtin;
 const assert = std.debug.assert;

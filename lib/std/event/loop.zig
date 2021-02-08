@@ -802,7 +802,7 @@ pub const Loop = struct {
 
         const Self = @This();
         const atomic = std.sync.atomic;
-        const Futex = std.sync.futex.os;
+        const Futex = std.sync.primitives.os.Futex;
 
         fn wait(self: *Self) void {
             return self.waitInner(null) catch unreachable;
@@ -815,7 +815,7 @@ pub const Loop = struct {
         fn waitInner(self: *Self, timeout: ?u64) error{TimedOut}!void {
             var deadline: ?u64 = null;
             if (timeout) |timeout_ns| {
-                deadline = Futex.now() + timeout_ns;
+                deadline = std.time.now() + timeout_ns;
             }
 
             while (true) {
@@ -827,14 +827,14 @@ pub const Loop = struct {
                 try Futex.wait(
                     @ptrCast(*const u32, &self.state),
                     @enumToInt(@TypeOf(self.state).unset),
-                    deadline,
+                    .{ .Deadline = deadline },
                 );
             }
         }
 
         fn set(self: *Self) void {
             if (atomic.swap(&self.state, .set, .SeqCst) == .unset) {
-                Futex.wake(@ptrCast(*const u32, &self.state), 1);
+                Futex.notifyOne(@ptrCast(*const u32, &self.state));
             }
         }
     };

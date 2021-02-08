@@ -25,6 +25,14 @@ pub fn Mutex(comptime parking_lot: type) type {
 
         pub const Cancellation = parking_lot.WaitEvent.Cancellation;
 
+        pub fn deinit(self: *Self) void {
+            if (helgrind) |hg| {
+                hg.annotateHappensBeforeForgetAll(@ptrToInt(self));
+            }
+
+            self.* = undefined;
+        }
+
         pub fn tryAcquire(self: *Self) ?Held {
             const acquired = switch (builtin.arch) {
                 .i386, .x86_64 => atomic.bitSet(

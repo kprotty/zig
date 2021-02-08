@@ -14,10 +14,16 @@ const helgrind: ?type = if (builtin.valgrind_support) std.valgrind.helgrind else
 pub fn ParkingLot(comptime Config: type) type {
     return struct {
         // TODO: Document
+        pub usingnamespace if (@hasDecl(Config, "Futex"))
+            struct { pub const WaitFutex = Config.Futex }
+        else
+            struct {};
+
+        // TODO: Document
         pub const WaitEvent: type = if (@hasDecl(Config, "Event"))
             Config.Event
         else if (@hasDecl(Config, "Futex"))
-            DefaultFutexEvent(Config.Futex)
+            @import("../primitives/Event.zig").Event(@This())
         else
             @compileError("ParkingLot requires either an Event or Futex implementation");
 
@@ -25,15 +31,10 @@ pub fn ParkingLot(comptime Config: type) type {
         pub const WaitLock: type = if (@hasDecl(Config, "Lock"))
             Config.Lock
         else if (@hasDecl(Config, "Futex"))
-            DefaultFutexLock(Config.Futex)
+            @import("../primitives/Lock.zig").Lock(@This())
         else
+            
             DefaultEventLock(WaitEvent);
-
-        // TODO: Document
-        pub const WaitFutex: type = if (@hasDecl(Config, "Futex"))
-            Config.Futex
-        else
-            DefaultFutex(@This());
 
         // TODO: Document
         pub const wait_bucket_count: usize = if (@hasDecl(Config, "bucket_count"))
@@ -131,6 +132,10 @@ pub fn ParkingLot(comptime Config: type) type {
             node.event.wait(cancellation) catch {
                 cancelled = true;
             };
+
+            if (helgrind) |hg| {
+                hg.annotateHappensAfter(address);
+            }
 
             // If our wait was cancelled, we need to remove our Wait
             if (cancelled) {
@@ -270,8 +275,14 @@ pub fn ParkingLot(comptime Config: type) type {
             // Set the event for all the WaitNodes that we unpark.
             // This is done after any WaitBucket locks are dropped.
             var unparked = WaitList{};
-            defer while (unparked.pop()) |node| {
-                node.event.set();
+            defer if (unparked.len > 0) {
+                if (helgrind) |hg| {
+                    hg.annotateHappensBefore(address);
+                }
+
+                while (unparked.pop()) |node| {
+                    node.event.set();
+                }
             };
 
             // Grab the bucket lock in order to dequeue and wake them.
@@ -324,8 +335,14 @@ pub fn ParkingLot(comptime Config: type) type {
             // Set the event for all the WaitNodes that we unpark.
             // This is done after any WaitBucket locks are dropped.
             var unparked = WaitList{};
-            defer while (unparked.pop()) |node| {
-                node.event.set();
+            defer if (unparked.len > 0) {
+                if (helgrind) |hg| {
+                    hg.annotateHappensBefore(address);
+                }
+                
+                while (unparked.pop()) |node| {
+                    node.event.set();
+                }
             };
 
             // Acquire the bucket lock for the main address.
@@ -705,64 +722,6 @@ pub fn ParkingLot(comptime Config: type) type {
     };
 }
 
-fn DefaultFutex(comptime parking_lot: type) type {
-    return struct {
-        pub const Cancellation = parking_lot.WaitEvent.Cancellation;
-
-        pub fn wait(ptr: *const u32, expected: u32, cancellation: ?*Cancellation) error{Cancelled}!void {
-            const Parker = struct {
-                wait_ptr: *const u32,
-                wait_expected: u32,
-
-                pub fn onValidate(parker: @This()) ?parking_lot.Token {
-                    if (atomic.load(parker.wait_ptr, .SeqCst) == parker.wait_expected) {
-                        return 0;
-                    } else {
-                        return null;
-                    }
-                }
-
-                pub fn onBeforeWait(parker: @This()) void {
-                    // no-op
-                }
-
-                pub fn onCancel(parker: @This(), unparked: parking_lot.Unparked) void {
-                    // no-op
-                }
-            };
-
-            _ = parking_lot.park(
-                @ptrToInt(ptr) >> @sizeOf(@TypeOf(ptr.*)),
-                cancellation,
-                Parker{
-                    .wait_ptr = ptr,
-                    .wait_expected = expected,
-                },
-            ) catch |err| switch (err) {
-                error.Invalidated => {},
-                error.Cancelled => return error.Cancelled,
-            };
-        }
-
-        pub fn wake(ptr: *const u32) void {
-            const Unparker = struct {
-                pub fn onUnpark(unparker: @This(), unparked: parking_lot.Unparked) parking_lot.Token {
-                    return 0;
-                }
-            };
-
-            parking_lot.unparkOne(
-                @ptrToInt(ptr) >> @sizeOf(@TypeOf(ptr.*)),
-                Unparker{},
-            );
-        }
-
-        pub fn yield(iteration: usize) bool {
-            return parking_lot.WaitEvent.yield(iteration);
-        }
-    };
-}
-
 fn DefaultFutexEvent(comptime Futex: type) type {
     return struct {
         state: State,
@@ -839,7 +798,7 @@ fn DefaultFutexEvent(comptime Futex: type) type {
 }
 
 fn DefaultFutexLock(comptime Futex: type) type {
-    return @import("./Lock.zig").Lock(struct {
+    return @import("../primitives/Lock.zig").Lock(struct {
         pub const WaitFutex = Futex;
     });
 }

@@ -18,6 +18,14 @@ pub fn ResetEvent(comptime parking_lot: type) type {
 
         pub const Cancellation = parking_lot.WaitEvent.Cancellation;
 
+        pub fn deinit(self: *Self) void {
+            if (helgrind) |hg| {
+                hg.annotateHappensBeforeForgetAll(@ptrToInt(self));
+            }
+
+            self.* = undefined;
+        }
+
         pub fn isSet(self: *const Self) bool {
             if (!atomic.load(&self.is_set, .Acquire)) {
                 return false;
