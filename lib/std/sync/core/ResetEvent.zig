@@ -11,12 +11,16 @@ const builtin = std.builtin;
 const helgrind: ?type = if (builtin.valgrind_support) std.valgrind.helgrind else null;
 
 pub fn ResetEvent(comptime parking_lot: type) type {
+    if (@hasDecl(parking_lot.backend, "CoreResetEvent")) {
+        return parking_lot.backend.CoreResetEvent;
+    }
+
     return struct {
         is_set: bool = false,
 
         const Self = @This();
 
-        pub const Cancellation = parking_lot.WaitEvent.Cancellation;
+        pub const Cancellation = parking_lot.Cancellation;
 
         pub fn deinit(self: *Self) void {
             if (helgrind) |hg| {
@@ -98,6 +102,10 @@ pub fn ResetEvent(comptime parking_lot: type) type {
                 error.Invalidated => {},
                 error.Cancelled => return error.Cancelled,
             };
+        }
+
+        pub fn yield(iteration: usize) bool {
+            return @import("./Futex.zig").Futex(parking_lot).yield(iteration);
         }
     };
 }

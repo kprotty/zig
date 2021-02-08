@@ -6,33 +6,38 @@
 
 const std = @import("../../std.zig");
 const atomic = @import("../atomic.zig");
-const ParkingLot = @import("./ParkingLot.zig").ParkingLot;
 
 const builtin = std.builtin;
 const assert = std.debug.assert;
 
 pub usingnamespace if (builtin.os.tag == .windows)
-    WindowsParkingLot
+    WindowsBackend
 else if (builtin.os.tag == .linux)
-    LinuxParkingLot
-else if (std.Target.current.isDarwin() and DarwinParkingLot.is_supported)
-    DarwinParkingLot
+    LinuxBackend
+else if (std.Target.current.isDarwin() and DarwinBackend.is_supported)
+    DarwinBackend
 else if (builtin.link_libc)
-    PosixParkingLot
+    PosixBackend
 else
-    UnknownOsParkingLot;
+    UnhandledOsBackend;
 
-/// A ParkingLot implementation for operating systems we don't have blocking primitives for.
-const UnknownOsParkingLot = ParkingLot(struct {
-    pub const FairTimeout = SystemTimeout;
+/// A ParkingLot backend which blocks the OS thread by falling back to std.time.sleep()
+const UnhandledOsBackend = struct {
+    // Unhandled OS, so nothing to optimize against.
+    pub const bucket_count = 1;
+
+    // Use the generic OS timing facilities
+    pub const Timeout = OsTimeout;
+    pub const Cancellation = OsCancellation;
+
+    // Futex implementation which blocks via std.time.sleep()
     pub const Futex = struct {
-        pub const Cancellation = SystemCancellation;
-
         pub fn wait(ptr: *const u32, expected: u32, cancellation: ?*Cancellation) error{Cancelled}!void {
-            while (true) {
+             while (true) {
                 if (atomic.load(ptr, .SeqCst) != expected) {
                     return;
                 }
+
                 std.time.sleep(blk: {
                     if (cancellation) |cc| {
                         break :blk (cc.nanoseconds() orelse return error.Cancelled);
@@ -43,7 +48,11 @@ const UnknownOsParkingLot = ParkingLot(struct {
             }
         }
 
-        pub fn wake(ptr: *const u32) void {
+        pub fn notify(ptr: *const u32) void {
+            // no-op
+        }
+
+        pub fn notifyAll(ptr: *const u32) void {
             // no-op
         }
 
@@ -51,19 +60,23 @@ const UnknownOsParkingLot = ParkingLot(struct {
             return false;
         }
     };
-});
+};
 
-/// A ParkingLot implementation backed by linux futex
-const LinuxParkingLot = ParkingLot(struct {
+/// A ParkingLot backend which blocks using linux futex
+const LinuxBackend = struct {
     // Linux kernel's futex impl multiplies this by logical cpu core count.
     // We use tree based lookup instead of linked lists traversal for the
-    // userspace implementation so this is probably enough.
+    // userspace implementation in ParkingLot so this is probably enough.
     pub const bucket_count = 256;
-    pub const FairTimeout = SystemTimeout;
+    
+    // Use the generic OS timing facilities
+    pub const Timeout = OsTimeout;
+    pub const Cancellation = OsCancellation;
+
+    // Futex implementation using the primiary target of the abstraction: linux futex.
+    pub const CoreFutex = Futex;
     pub const Futex = struct {
         const linux = std.os.linux;
-
-        pub const Cancellation = SystemCancellation;
 
         pub fn wait(ptr: *const u32, expected: u32, cancellation: ?*Cancellation) error{Cancelled}!void {
             var ts: linux.timespec = undefined;
@@ -96,11 +109,19 @@ const LinuxParkingLot = ParkingLot(struct {
             }
         }
 
-        pub fn wake(ptr: *const u32) void {
+        pub inline fn notify(ptr: *const u32) void {
+            return wake(ptr, 1);
+        }
+
+        pub inline fn notifyAll(ptr: *const u32) void {
+            return wake(ptr, std.math.maxInt(i32));
+        }
+
+        fn wake(ptr: *const u32, num_waiters_to_wake: i32) void {
             switch (linux.getErrno(linux.futex_wake(
                 @ptrCast(*const i32, ptr),
                 linux.FUTEX_PRIVATE_FLAG | linux.FUTEX_WAKE,
-                1, // max waiters to wake
+                num_waiters_to_wake,
             ))) {
                 0 => {},
                 std.os.EACCES => {},
@@ -115,9 +136,9 @@ const LinuxParkingLot = ParkingLot(struct {
 
         pub fn yield(iteration: usize) bool {
             // Don't spin on low-power devices as the latency there is not worth the power draw
-            const target = std.Target.current;
-            if (comptime target.cpu.arch.isARM() or target.cpu.arch.isMIPS()) {
-                return false;
+            switch (builtin.arch) {
+                .i386, .x86_64, .sparc, sparcv9, .sparcel, .s390x => {},
+                else => return false,
             }
 
             // On linux we don't use sched_yield...
@@ -141,9 +162,10 @@ const LinuxParkingLot = ParkingLot(struct {
             return false;
         }
     };
-});
+};
 
-const DarwinParkingLot = struct {
+/// A ParkingLot backend which blocks using the undocumented __ulock functions for Darwin XNU.
+const DarwinBackend = struct {
     // See: https://github.com/apple/darwin-libplatform/search?q=OS_UNFAIR_LOCK_AVAILABILITY
     const darwin = std.os.darwin;
     const version = std.Target.current.os.version_range.semver.min;
@@ -155,89 +177,108 @@ const DarwinParkingLot = struct {
         else => unreachable,
     };
 
-    pub usingnamespace ParkingLot(struct {
-        // Smaller bucket count to decrease current macho globals explosion
-        pub const bucket_count = 64;
-        pub const FairTimeout = SystemTimeout;
-        pub const Futex = struct {
-            pub const Cancellation = SystemCancellation;
+    // Smaller bucket count to decrease current macho globals explosion
+    pub const bucket_count = 64;
 
-            pub fn wait(ptr: *const u32, expected: u32, cancellation: ?*Cancellation) error{Cancelled}!void {
-                // timeout = 0 indicates TIMEOUT_WAIT_FOREVER
-                // https://github.com/apple/darwin-xnu/blob/main/bsd/kern/sys_ulock.c
-                var timeout_us: u32 = 0;
-                if (cancellation) |cc| {
-                    const timeout_ns = cc.nanoseconds() orelse return error.Cancelled;
-                    const timeout_unit = timeout_ns / std.time.ns_per_us;
-                    timeout_us = std.math.cast(u32, timeout_unit) catch std.math.maxInt(u32);
+    // Use the generic OS timing facilities
+    pub const Timeout = OsTimeout;
+    pub const Cancellation = OsCancellation;
+
+    // Futex implementation which blocks using the undocumented __ulock primitives.
+    pub const CoreFutex = Futex;
+    pub const Futex = struct {
+        pub fn wait(ptr: *const u32, expected: u32, cancellation: ?*Cancellation) error{Cancelled}!void {
+            // timeout = 0 indicates TIMEOUT_WAIT_FOREVER
+            // https://github.com/apple/darwin-xnu/blob/main/bsd/kern/sys_ulock.c
+            var timeout_us: u32 = 0;
+            if (cancellation) |cc| {
+                const timeout_ns = cc.nanoseconds() orelse return error.Cancelled;
+                const timeout_unit = timeout_ns / std.time.ns_per_us;
+                timeout_us = std.math.cast(u32, timeout_unit) catch std.math.maxInt(u32);
+            }
+
+            const rc = darwin.__ulock_wait(
+                darwin.UL_COMPARE_AND_WAIT | darwin.ULF_NO_ERRNO,
+                @ptrCast(*const c_void, ptr),
+                @as(u64, expect),
+                timeout_us,
+            );
+
+            if (ret < 0) {
+                switch (-ret) {
+                    darwin.EINTR => continue,
+                    darwin.EFAULT => unreachable,
+                    darwin.ETIMEDOUT => return error.Cancelled,
+                    else => |errno| {
+                        const err = std.os.unexpectedErrno(@intCast(usize, errno));
+                        unreachable;
+                    },
                 }
+            }
+        }
 
-                const rc = darwin.__ulock_wait(
-                    darwin.UL_COMPARE_AND_WAIT | darwin.ULF_NO_ERRNO,
+        pub inline fn notify(ptr: *const u32) void {
+            return wake(ptr, 0);
+        }
+
+        pub inline fn notifyAll(ptr: *const u32) void {
+            return wake(ptr, darwin.ULF_WAKE_ALL);
+        }
+
+        fn wake(ptr: *const u32, flags: u32) void {
+            while (true) {
+                const ret = darwin.__ulock_wake(
+                    darwin.UL_COMPARE_AND_WAIT | darwin.ULF_NO_ERRNO | flags,
                     @ptrCast(*const c_void, ptr),
-                    @as(u64, expect),
-                    timeout_us,
+                    @as(u64, 0),
                 );
 
                 if (ret < 0) {
                     switch (-ret) {
+                        darwin.ENOENT => {},
+                        darwin.EFAULT => {},
                         darwin.EINTR => continue,
-                        darwin.EFAULT => unreachable,
-                        darwin.ETIMEDOUT => return error.Cancelled,
                         else => |errno| {
                             const err = std.os.unexpectedErrno(@intCast(usize, errno));
                             unreachable;
                         },
                     }
                 }
+
+                return;
             }
+        }
 
-            pub fn wake(ptr: *const u32) void {
-                while (true) {
-                    const ret = darwin.__ulock_wake(
-                        darwin.UL_COMPARE_AND_WAIT | darwin.ULF_NO_ERRNO,
-                        @ptrCast(*const c_void, ptr),
-                        @as(u64, 0),
-                    );
-
-                    if (ret < 0) {
-                        switch (-ret) {
-                            darwin.ENOENT => {},
-                            darwin.EFAULT => {},
-                            darwin.EINTR => continue,
-                            else => |errno| {
-                                const err = std.os.unexpectedErrno(@intCast(usize, errno));
-                                unreachable;
-                            },
-                        }
-                    }
-
-                    return;
-                }
-            }
-
-            pub fn yield(iteration: usize) bool {
-                // Don't spin on the mobile platforms like iOS and watchOS 
-                // as battery and avoiding priority inversion are worth more there.
-                if (builtin.os.tag != .macos) {
-                    return false;
-                }
-                
-                // After benchmarking on M1/BigSur, this appears to be a decent spin count for various cases.
-                if (iteration < 5) {
-                    var spin = @as(usize, 8) << @intCast(std.math.Log2Int(usize), iteration);
-                    while (spin > 0) : (spin -= 1) atomic.spinLoopHint();
-                    return true;
-                }
-
+        pub fn yield(iteration: usize) bool {
+            // Don't spin on the mobile platforms like iOS and watchOS 
+            // as battery and avoiding priority inversion are worth more there.
+            if (builtin.os.tag != .macos) {
                 return false;
             }
-        };
-    });
+            
+            // After benchmarking on M1/BigSur, this appears to be a decent spin count for various cases.
+            if (iteration < 5) {
+                var spin = @as(usize, 8) << @intCast(std.math.Log2Int(usize), iteration);
+                while (spin > 0) : (spin -= 1) atomic.spinLoopHint();
+                return true;
+            }
+
+            return false;
+        }
+    };
 };
 
-const PosixParkingLot = ParkingLot(struct {
-    pub const FairTimeout = SystemTimeout;
+/// A ParkingLot backend which blocks using pthread primitives
+const PosixBackend = struct {
+    // Generically sized bucket count which is often "good enough" (256 on 64bit, 128 on 32bit, etc.).
+    // For 64bit, this boils down to about the same bucket count size used in linux-futex / Go-runtime.sema.
+    pub const bucket_count = std.meta.bitCount(usize) << 2;
+
+    // Use the generic OS timing facilities
+    pub const Timeout = OsTimeout;
+    pub const Cancellation = OsCancellation;
+
+    // ParkingLot Event implementation which blocks the caller using pthread data structures.
     pub const Event = struct {
         state: State,
         cond: c.pthread_cond_t,
@@ -383,23 +424,19 @@ const PosixParkingLot = ParkingLot(struct {
             return ts;
         }
     };
-});
+};
 
-const WindowsParkingLot = struct {
+const WindowsBackend = struct {
     const windows = std.os.windows;
 
-    pub usingnamespace ParkingLot(struct {
-        pub const bucket_count = NT_BUCKET_COUNT;
-        pub const FairTimeout = NtTimeout;
-        pub const Lock = NtLock;
-        pub const Event = NtEvent;
-    });
-
     /// Same size as windows.PEB.WaitOnAddressHashTable
-    const NT_BUCKET_COUNT = 128; 
+    pub const bucket_count = 128;
 
-    /// Custom FairTimeout implementation which is less precise than SystemTimeout but faster to query.
-    const NtTimeout = struct {
+    /// Use the OS cancellation object to keep the same API.
+    pub const Cancellation = OsCancellation;
+
+    /// ParkingLot Timeout implementation which is less precise than SystemTimeout but faster to query.
+    pub const Timeout = struct {
         interrupt_time_100ns: u64 = 0,
 
         pub fn beFair(self: *@This(), fair_rng: u64) bool {
@@ -422,9 +459,9 @@ const WindowsParkingLot = struct {
             const INTERRUPT_TIME = KUSER_SHARED_DATA + 0x8;
 
             while (true) {
-                // Must reaed user_high, then user_low, then kernel_high.
+                // Must read user_high, then user_low, then kernel_high.
                 // Snapshot is valid if user_high == kernel_high.
-                // TODO: would volatile reads break ordering?
+                // TODO: would switching to inexpensive volatile reads break ordering?
                 const user_time_high = atomic.load(@intToPtr(*u32, INTERRUPT_TIME + 4), .SeqCst);
                 const user_time_low = atomic.load(@intToPtr(*u32, INTERRUPT_TIME + 0), .SeqCst);
                 const kernel_time_high = atomic.load(@intToPtr(*u32, INTERRUPT_TIME + 8), .SeqCst);
@@ -441,11 +478,8 @@ const WindowsParkingLot = struct {
         }
     };
 
-    /// ParkingLot.Lock implementation backed by this ParkingLot implementation which is backend by NtKeyedEvents
-    const NtLock = @import("../primitives/Lock.zig").Lock(@This());
-
     /// ParkingLot.Event implementation backed by NtKeyedEvents
-    const NtEvent = struct {
+    pub const Event = struct {
         state: State,
 
         const Self = @This();
@@ -474,8 +508,6 @@ const WindowsParkingLot = struct {
                 .notified => unreachable, // multiple Event.set()'s performed.
             }
         }
-
-        pub const Cancellation = SystemCancellation;
 
         pub fn wait(self: *Self, cancellation: ?*Cancellation) error{Cancelled}!void {
             // Try to mark the event as waiting if its not set.
@@ -642,11 +674,11 @@ const WindowsParkingLot = struct {
     };
 };
 
-/// A ParkingLot FairTimeout which expires around every 1ms according to the system
-const SystemTimeout = struct {
+/// A ParkingLot Timeout implementation which expires around every 1ms according to the OS.
+const OsTimeout = struct {
     expires: u64 = 0,
 
-    pub fn beFair(self: *SystemTimeout, fair_rng: u64) bool {
+    pub fn beFair(self: *OsTimeout, fair_rng: u64) bool {
         // Use std.time.Clock.Precise instead of std.time.now() 
         // since we don't really need the monotonic property here.
         const now = std.time.Clock.Precise.read() orelse 0;
@@ -663,11 +695,11 @@ const SystemTimeout = struct {
 };
 
 /// The cancellation token used for OS based ParkingLot
-const SystemCancellation = union(enum) {
+const OsCancellation = union(enum) {
     Duration: u64,
     Deadline: u64,
 
-    fn nanoseconds(self: *SystemCancellation) ?u64 {
+    pub fn nanoseconds(self: *OsCancellation) ?u64 {
         const now = std.time.now();
         switch (self.*) {
             .Duration => |duration| {

@@ -12,138 +12,66 @@ const testing = std.testing;
 const helgrind: ?type = if (builtin.valgrind_support) std.valgrind.helgrind else null;
 
 pub fn Lock(comptime parking_lot: type) type {
+    if (@hasDecl(parking_lot.backend, "CoreLock")) {
+        return parking_lot.backend.CoreLock;
+    }
+
     return struct {
-        state: State = .unlocked,
+        impl: LockImpl = .{},
 
         const Self = @This();
-        const Futex = parking_lot.WaitFutex;
-        const State = enum(u32) {
-            unlocked,
-            locked,
-            contended,
-        };
+        const Futex = @import("./Futex.zig").Futex(parking_lot);
+        const LockImpl = @import("./generic/FutexLock.zig").FutexLock(Futex, Cancellation);
+
+        pub const Cancellation = parking_lot.Cancellation;
 
         pub fn deinit(self: *Self) void {
-            if (helgrind) |hg| {
-                hg.annotateHappensBeforeForgetAll(@ptrToInt(self));
-            }
-
-            self.* = undefined;
+            return self.impl.deinit();
         }
 
-        pub fn tryAcquire(self: *Self) ?Held {
-            if (atomic.compareAndSwap(
-                &self.state,
-                .unlocked,
-                .locked,
-                .Acquire,
-                .Relaxed,
-            )) |failed| {
-                return null;
-            }
-
-            if (helgrind) |hg| {
-                hg.annotateHappensAfter(@ptrToInt(self));
-            }
-
-            return Held{ .lock = self };
+        pub inline fn tryAcquire(self: *Self) ?Held {
+            const held_impl = self.impl.tryAcquire() orelse return null;
+            return Held{ .impl = held_impl };
         }
 
-        pub fn acquire(self: *Self) Held {
-            const state = atomic.swap(&self.state, .locked, .Acquire);
-            if (state != .unlocked) {
-                self.acquireSlow(state);
-            }
-
-            if (helgrind) |hg| {
-                hg.annotateHappensAfter(@ptrToInt(self));
-            }
-
-            return Held{ .lock = self };
+        pub inline fn acquire(self: *Self) Held {
+            const held_impl = self.impl.acquire();
+            return Held{ .impl = held_impl };
         }
 
-        fn acquireSlow(self: *Self, current_state: State) void {
-            @setCold(true);
-            
-            var adaptive_spin: usize = 0;
-            var new_state = current_state;
-            var state = atomic.load(&self.state, .Relaxed);
-
-            while (true) {
-                while (true) {
-                    switch (state) {
-                        .unlocked => _ = atomic.compareAndSwap(
-                            &self.state,
-                            .unlocked,
-                            new_state,
-                            .Acquire,
-                            .Relaxed,
-                        ) orelse return,
-                        .locked => {},
-                        .contended => break,
-                    }
-
-                    if (Futex.yield(adaptive_spin)) {
-                        adaptive_spin +%= 1;
-                        state = atomic.load(&self.state, .Relaxed);
-                    } else {
-                        break;
-                    }
-                }
-
-                new_state = .contended;
-                if (state != .contended) {
-                    state = atomic.swap(&self.state, new_state, .Acquire);
-                    if (state == .unlocked) {
-                        return;
-                    }
-                }
-
-                // Wait on the Lock while its contended and try to acquire it again when we wake up.
-                Futex.wait(
-                    @ptrCast(*const u32, &self.state),
-                    @enumToInt(State.contended),
-                    null,
-                ) catch unreachable;
-                adaptive_spin = 0;
-                state = atomic.load(&self.state, .Relaxed);
-            }
+        pub inline fn acquireWith(self: *Self, cancellation: Cancellation) error{Cancelled}!Held {
+            const held_impl = try self.impl.acquireWith(cancellation);
+            return Held{ .impl = held_impl };
         }
 
         pub const Held = struct {
-            lock: *Self,
+            impl: LockImpl.Held,
 
             pub fn release(self: Held) void {
-                return self.lock.release();
+                return self.impl.release();
             }
         };
-
-        fn release(self: *Self) void {
-            switch (atomic.swap(&self.state, .unlocked, .Release)) {
-                .unlocked => unreachable,
-                .locked => {},
-                .contended => self.releaseSlow(),
-            }
-        }
-
-        fn releaseSlow(self: *Self) void {
-            @setCold(true);
-            Futex.wake(@ptrCast(*const u32, &self.state));
-        }
     };
 }
 
 test "Lock - OS" {
     try testLock(
-        Lock(@import("../parking_lot/os.zig")),
+        Lock(std.sync.core.with(std.sync.backend.os).parking_lot),
         std.Thread,
     );
 }
 
 test "Lock - Spin" {
     try testLock(
-        Lock(@import("../parking_lot/spin.zig")),
+        Lock(std.sync.core.with(std.sync.backend.spin).parking_lot),
         std.Thread,
+    );
+}
+
+test "Lock - Serial" {
+    try testLock(
+        Lock(std.sync.core.with(std.sync.backend.serial).parking_lot),
+        null,
     );
 }
 

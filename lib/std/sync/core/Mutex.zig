@@ -11,6 +11,10 @@ const builtin = std.builtin;
 const helgrind: ?type = if (builtin.valgrind_support) std.valgrind.helgrind else null;
 
 pub fn Mutex(comptime parking_lot: type) type {
+    if (@hasDecl(parking_lot.backend, "CoreMutex")) {
+        return parking_lot.backend.CoreMutex;
+    }
+
     return struct {
         state: u8 = UNLOCKED,
 
@@ -23,7 +27,7 @@ pub fn Mutex(comptime parking_lot: type) type {
 
         const Self = @This();
 
-        pub const Cancellation = parking_lot.WaitEvent.Cancellation;
+        pub const Cancellation = parking_lot.Cancellation;
 
         pub fn deinit(self: *Self) void {
             if (helgrind) |hg| {
@@ -122,7 +126,7 @@ pub fn Mutex(comptime parking_lot: type) type {
                 }
 
                 if (state & PARKED == 0) {
-                    if (parking_lot.WaitEvent.yield(adaptive_spin)) {
+                    if (parking_lot.Event.yield(adaptive_spin)) {
                         adaptive_spin +%= 1;
                         state = atomic.load(&self.state, .Relaxed);
                         continue;

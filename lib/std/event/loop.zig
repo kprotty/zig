@@ -802,7 +802,7 @@ pub const Loop = struct {
 
         const Self = @This();
         const atomic = std.sync.atomic;
-        const Futex = std.sync.primitives.os.Futex;
+        const Futex = std.sync.core.with(std.sync.backend.os).Futex;
 
         fn wait(self: *Self) void {
             return self.waitInner(null) catch unreachable;

@@ -11,6 +11,10 @@ const builtin = std.builtin;
 const helgrind: ?type = if (builtin.valgrind_support) std.valgrind.helgrind else null;
 
 pub fn Once(comptime parking_lot: type) type {
+    if (@hasDecl(parking_lot.backend, "CoreOnce")) {
+        return parking_lot.backend.CoreOnce;
+    }
+
     return struct {
         state: State = .uninit,
 
