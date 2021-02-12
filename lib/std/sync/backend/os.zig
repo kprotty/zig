@@ -135,9 +135,10 @@ const LinuxBackend = struct {
         }
 
         pub fn yield(iteration: usize) bool {
-            // Don't spin on low-power devices as the latency there is not worth the power draw
+            // Don't spin on low-power devices as the potential 
+            // smaller latency there is not worth the power draw.
             switch (builtin.arch) {
-                .i386, .x86_64, .sparc, sparcv9, .sparcel, .s390x => {},
+                .i386, .x86_64 => {},
                 else => return false,
             }
 
@@ -621,7 +622,7 @@ const WindowsBackend = struct {
             unavailable,
         };
         
-        inline fn _isSupported() bool {
+        inline fn isSupported() bool {
             const has_api = std.Target.current.os.version_range.windows.isAtLeast(.win8) orelse false;
             if (!has_api) {
                 return false;
