@@ -14,7 +14,7 @@ pub usingnamespace if (builtin.os.tag == .windows)
     WindowsBackend
 else if (builtin.os.tag == .linux)
     LinuxBackend
-else if (std.Target.current.isDarwin() and DarwinBackend.is_supported)
+else if (std.Target.current.isDarwin())
     DarwinBackend
 else if (builtin.link_libc)
     PosixBackend
@@ -65,8 +65,8 @@ const UnhandledOsBackend = struct {
 /// A ParkingLot backend which blocks using linux futex
 const LinuxBackend = struct {
     // Linux kernel's futex impl multiplies this by logical cpu core count.
-    // We use tree based lookup instead of linked lists traversal for the
-    // userspace implementation in ParkingLot so this is probably enough.
+    // We use tree based lookup in ParkingLot instead of the linked list traversal
+    // employed in the linux kernel which should account for the smaller bucket size.
     pub const bucket_count = 256;
     
     // Use the generic OS timing facilities
@@ -166,16 +166,8 @@ const LinuxBackend = struct {
 
 /// A ParkingLot backend which blocks using the undocumented __ulock functions for Darwin XNU.
 const DarwinBackend = struct {
-    // See: https://github.com/apple/darwin-libplatform/search?q=OS_UNFAIR_LOCK_AVAILABILITY
     const darwin = std.os.darwin;
     const version = std.Target.current.os.version_range.semver.min;
-    const is_supported = switch (builtin.os.tag) {
-        .macos => (version.major >= 10) and (version.minor >= 12),
-        .ios => (version.major >= 10) and (version.minor >= 0),
-        .tvos => (version.major >= 10) and (version.minor >= 0),
-        .watchos => (version.major >= 3) and (version.minor >= 0),
-        else => unreachable,
-    };
 
     // Smaller bucket count to decrease current macho globals explosion
     pub const bucket_count = 64;
@@ -184,69 +176,32 @@ const DarwinBackend = struct {
     pub const Timeout = OsTimeout;
     pub const Cancellation = OsCancellation;
 
-    // Futex implementation which blocks using the undocumented __ulock primitives.
-    pub const CoreFutex = Futex;
-    pub const Futex = struct {
-        pub fn wait(ptr: *const u32, expected: u32, cancellation: ?*Cancellation) error{Cancelled}!void {
-            // timeout = 0 indicates TIMEOUT_WAIT_FOREVER
-            // https://github.com/apple/darwin-xnu/blob/main/bsd/kern/sys_ulock.c
-            var timeout_us: u32 = 0;
-            if (cancellation) |cc| {
-                const timeout_ns = cc.nanoseconds() orelse return error.Cancelled;
-                const timeout_unit = timeout_ns / std.time.ns_per_us;
-                timeout_us = std.math.cast(u32, timeout_unit) catch std.math.maxInt(u32);
-            }
+    // Use a pthread-backed event over __ulock futex one for stability & app-store compatibility.
+    // Not a direct `Event = PosixBackend.Event` as it uses a darwin tailored spinning strategy.
+    pub const Event = struct {
+        inner: InnerEvent,
 
-            const rc = darwin.__ulock_wait(
-                darwin.UL_COMPARE_AND_WAIT | darwin.ULF_NO_ERRNO,
-                @ptrCast(*const c_void, ptr),
-                @as(u64, expect),
-                timeout_us,
-            );
+        const Self = @This();
+        const InnerEvent = PosixBackend.Event;
 
-            if (ret < 0) {
-                switch (-ret) {
-                    darwin.EINTR => continue,
-                    darwin.EFAULT => unreachable,
-                    darwin.ETIMEDOUT => return error.Cancelled,
-                    else => |errno| {
-                        const err = std.os.unexpectedErrno(@intCast(usize, errno));
-                        unreachable;
-                    },
-                }
-            }
+        pub inline fn init(self: *Self) void {
+            self.inner.init();
         }
 
-        pub inline fn notify(ptr: *const u32) void {
-            return wake(ptr, 0);
+        pub inline fn deinit(self: *Self) void {
+            self.inner.deinit();
         }
 
-        pub inline fn notifyAll(ptr: *const u32) void {
-            return wake(ptr, darwin.ULF_WAKE_ALL);
+        pub inline fn reset(self: *Self) void {
+            self.inner.reset();
         }
 
-        fn wake(ptr: *const u32, flags: u32) void {
-            while (true) {
-                const ret = darwin.__ulock_wake(
-                    darwin.UL_COMPARE_AND_WAIT | darwin.ULF_NO_ERRNO | flags,
-                    @ptrCast(*const c_void, ptr),
-                    @as(u64, 0),
-                );
+        pub inline fn set(self: *Self) void {
+            self.inner.set();
+        }
 
-                if (ret < 0) {
-                    switch (-ret) {
-                        darwin.ENOENT => {},
-                        darwin.EFAULT => {},
-                        darwin.EINTR => continue,
-                        else => |errno| {
-                            const err = std.os.unexpectedErrno(@intCast(usize, errno));
-                            unreachable;
-                        },
-                    }
-                }
-
-                return;
-            }
+        pub inline fn wait(self: *Self, cancellation: ?*Cancellation) error{Cancelled}!void {
+            return self.inner.wait(cancellation);
         }
 
         pub fn yield(iteration: usize) bool {
@@ -257,7 +212,7 @@ const DarwinBackend = struct {
             }
             
             // After benchmarking on M1/BigSur, this appears to be a decent spin count for various cases.
-            if (iteration < 5) {
+            if (iteration < 4) {
                 var spin = @as(usize, 8) << @intCast(std.math.Log2Int(usize), iteration);
                 while (spin > 0) : (spin -= 1) atomic.spinLoopHint();
                 return true;
@@ -265,6 +220,56 @@ const DarwinBackend = struct {
 
             return false;
         }
+    };
+
+    // Use os_unfair_lock when available over the default parking_lot.Lock
+    // as this internally implements priority inheritance and is 
+    // just as fast uncontended but slightly slower contended. 
+    pub usingnamespace if (OsUnfairLock.is_supported)
+        struct {
+            pub const Lock = OsUnfairLock;
+            
+            // Don't use os_unfair_lock for user-facing core.Lock implementation
+            // as the former provides less throughput on average since it is not
+            // guaranteed to, nor does it currently, employ adaptive spinning.
+            // 
+            // pub const CoreLock = OsUnfairLock;
+        }
+    else struct {};
+
+    const OsUnfairLock = struct {
+        oul: darwin.os_unfair_lock = darwin.OS_UNFAIR_LOCK_INIT,
+
+        // See: https://github.com/apple/darwin-libplatform/search?q=OS_UNFAIR_LOCK_AVAILABILITY
+        const Self = @This();
+        const is_supported = switch (builtin.os.tag) {
+            .macos => (version.major >= 10) and (version.minor >= 12),
+            .ios => (version.major >= 10) and (version.minor >= 0),
+            .tvos => (version.major >= 10) and (version.minor >= 0),
+            .watchos => (version.major >= 3) and (version.minor >= 0),
+            else => unreachable,
+        };
+
+        pub fn tryAcquire(self: *Self) ?Held {
+            if (darwin.os_unfair_lock_trylock(&self.oul)) {
+                return Held{ .lock = self };
+            } else {
+                return null;
+            }
+        }
+
+        pub fn acquire(self: *Self) Held {
+            darwin.os_unfair_lock_lock(&self.oul);
+            return Held{ .lock = self };
+        }
+
+        pub const Held = struct {
+            lock: *Self,
+
+            pub fn release(self: Held) void {
+                darwin.os_unfair_lock_unlock(&self.lock.oul);
+            }
+        };
     };
 };
 
