@@ -162,6 +162,9 @@ const LinuxBackend = struct {
             return false;
         }
     };
+
+    pub const CoreLock = Lock;
+    pub const Lock = @compileError("TODO: implement adaptive FUTEX_PI lock");
 };
 
 /// A ParkingLot backend which blocks using the undocumented __ulock functions for Darwin XNU.
@@ -483,8 +486,8 @@ const WindowsBackend = struct {
         }
     };
 
-    // Use SRWLock when available as its generally fast
-    // and windows has the opportunity to implement certain
+    // Use SRWLock primitives when available as they're generally
+    // fast and windows has the opportunity to implement certain
     // optimizations for it like priority inheritance in the future.
     pub usingnamespace if (SRWLock.is_supported)
         struct {

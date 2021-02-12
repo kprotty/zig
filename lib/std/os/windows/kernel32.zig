@@ -293,10 +293,10 @@ pub extern "kernel32" fn FlushFileBuffers(hFile: HANDLE) callconv(WINAPI) BOOL;
 pub extern "kernel32" fn WakeAllConditionVariable(c: *CONDITION_VARIABLE) callconv(WINAPI) void;
 pub extern "kernel32" fn WakeConditionVariable(c: *CONDITION_VARIABLE) callconv(WINAPI) void;
 pub extern "kernel32" fn SleepConditionVariableSRW(
-    c: *CONDITION_VARIABLE,
-    s: *SRWLOCK,
-    t: DWORD,
-    f: ULONG,
+    cond: *CONDITION_VARIABLE,
+    srwlock: *SRWLOCK,
+    timeout_ms: DWORD,
+    flags: ULONG,
 ) callconv(WINAPI) BOOL;
 
 pub extern "kernel32" fn TryAcquireSRWLockExclusive(s: *SRWLOCK) callconv(WINAPI) BOOLEAN;
