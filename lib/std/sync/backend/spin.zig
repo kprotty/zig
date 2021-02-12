@@ -9,6 +9,7 @@ const atomic = @import("../atomic.zig");
 
 // The only way spinning can cancel is by polling.
 pub const Cancellation = struct {
+    context: usize,
     isCancelledFn: fn(*Cancellation) bool,
 };
 

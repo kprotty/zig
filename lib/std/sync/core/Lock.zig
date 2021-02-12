@@ -39,11 +39,6 @@ pub fn Lock(comptime parking_lot: type) type {
             return Held{ .impl = held_impl };
         }
 
-        pub inline fn acquireWith(self: *Self, cancellation: Cancellation) error{Cancelled}!Held {
-            const held_impl = try self.impl.acquireWith(cancellation);
-            return Held{ .impl = held_impl };
-        }
-
         pub const Held = struct {
             impl: LockImpl.Held,
 
@@ -81,18 +76,21 @@ pub fn testLock(
 ) !void {
     {
         var lock = TestLock{};
-        defer lock.deinit();
+        defer if (@hasDecl(TestLock, "deinit")) {
+            lock.deinit();
+        };
 
         var held = lock.tryAcquire() orelse unreachable;
         testing.expectEqual(lock.tryAcquire(), null);
         held.release();
 
         held = lock.acquire();
-        defer held.release();
+        held.release();
     }
 
     const Thread = TestThread orelse return;
-
+    
+    const allocator = std.heap.page_allocator;
     const Contention = struct {
         index: usize = 0,
         case: Case = undefined,
@@ -154,9 +152,8 @@ pub fn testLock(
             /// The extreme case of many threads fighting over the same Lock.
             const High = struct {
                 fn setup(_: @This(), self: *Self) void {
-                    self.counters[0] = Counter{
-                        .remaining = 100_000,
-                    };
+                    self.counters = [_]Counter{Counter{ .remaining = 0 }} ** num_counters;
+                    self.counters[0].remaining = 100_000;
                 }
 
                 fn run(_: @This(), self: *Self) void {
@@ -172,9 +169,8 @@ pub fn testLock(
                 const local_iters = 50_000;
 
                 fn setup(_: @This(), self: *Self) void {
-                    self.counters[0] = Counter{
-                        .remaining = local_iters * num_counters,
-                    };
+                    self.counters = [_]Counter{Counter{ .remaining = 0 }} ** num_counters;
+                    self.counters[0].remaining = local_iters * num_counters;
                 }
 
                 fn run(_: @This(), self: *Self) void {
@@ -231,7 +227,6 @@ pub fn testLock(
         }
 
         fn execute(self: *Self) !void {
-            const allocator = testing.allocator;
             const threads = try allocator.alloc(*Thread, num_counters);
             defer allocator.free(threads);
 
@@ -261,13 +256,19 @@ pub fn testLock(
                     t.wait();
                 }
 
-                for (self.counters) |counter| {
+                for (self.counters) |*counter| {
                     testing.expectEqual(counter.remaining, 0);
+                    if (@hasDecl(TestLock, "deinit")) {
+                        counter.lock.deinit();
+                    }
                 }
             }
         }
     };
 
-    var contention = Contention{};
+    const contention = try allocator.create(Contention);
+    defer allocator.destroy(contention);
+
+    contention.* = Contention{};
     try contention.execute();
 }

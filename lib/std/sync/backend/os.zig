@@ -574,6 +574,44 @@ const WindowsBackend = struct {
         }
     };
 
+    pub usingnamespace if (SRWLock.is_supported)
+        struct {
+            pub const Lock = SRWLock;
+            pub const CoreLock = SRWLock;
+        }
+    else struct {};
+
+    const SRWLock = struct {
+        srwlock: windows.SRWLOCK = windows.SRWLOCK_INIT,
+
+        const Self = @This();
+        const is_supported = std.Target.current.os.version_range.windows.isAtLeast(.vista) orelse false;
+
+        pub fn deinit(self: *Self) void {
+            self.* = undefined;
+        }
+
+        pub fn tryAcquire(self: *Self) ?Held {
+            return switch (windows.kernel32.TryAcquireSRWLockExclusive(&self.srwlock)) {
+                0 => null,
+                else => Held{ .srwlock = &self.srwlock },
+            };
+        }
+
+        pub fn acquire(self: *Self) Held {
+            windows.kernel32.AcquireSRWLockExclusive(&self.srwlock);
+            return Held{ .srwlock = &self.srwlock };
+        }
+
+        pub const Held = struct {
+            srwlock: *windows.SRWLOCK,
+            
+            pub fn release(self: Held) void {
+                windows.kernel32.ReleaseSRWLockExclusive(self.srwlock);
+            }
+        };
+    };
+
     /// Windows NT Keyed Events API
     const NtKeyedEvent = struct {
         /// Wait on a wake() notification for a key using NtKeyedEvents.
@@ -699,16 +737,20 @@ const OsCancellation = union(enum) {
     Duration: u64,
     Deadline: u64,
 
+    pub inline fn now() u64 {
+        return std.time.now();
+    }
+
     pub fn nanoseconds(self: *OsCancellation) ?u64 {
-        const now = std.time.now();
+        const ts = OsCancellation.now();
         switch (self.*) {
             .Duration => |duration| {
-                self.* = .{ .Deadline = now + duration };
+                self.* = .{ .Deadline = ts + duration };
                 return duration;
             },
             .Deadline => |deadline| {
-                if (now > deadline) return null;
-                return deadline - now;
+                if (ts > deadline) return null;
+                return deadline - ts;
             },
         }
     }

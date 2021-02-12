@@ -29,7 +29,7 @@ pub fn ParkingLot(comptime Backend: type) type {
 
         // TODO: Document
         pub const Lock: type = if (@hasDecl(Backend, "Lock"))
-            Config.Lock
+            Backend.Lock
         else if (@hasDecl(Backend, "Futex"))
             @import("./generic/FutexLock.zig").FutexLock(Backend.Futex, Cancellation)
         else

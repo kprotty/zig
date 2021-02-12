@@ -55,7 +55,7 @@ pub fn FutexLock(
             return self.acquireFast(null) catch unreachable;
         }
 
-        pub inline fn acquireWith(self: *Self, cancellation: Cancellation) error{Cancelled}!Held {
+        pub inline fn tryAcquireWith(self: *Self, cancellation: Cancellation) error{Cancelled}!Held {
             return self.acquireFast(cancellation);
         }
 

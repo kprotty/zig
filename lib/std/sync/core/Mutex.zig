@@ -8,6 +8,7 @@ const std = @import("../../std.zig");
 const atomic = @import("../atomic.zig");
 
 const builtin = std.builtin;
+const testing = std.testing;
 const helgrind: ?type = if (builtin.valgrind_support) std.valgrind.helgrind else null;
 
 pub fn Mutex(comptime parking_lot: type) type {
@@ -74,7 +75,7 @@ pub fn Mutex(comptime parking_lot: type) type {
             return self.acquireFast(null) catch unreachable;
         }
 
-        pub inline fn acquireWith(self: *Self, cancellation: Cancellation) error{Cancelled}!Held {
+        pub inline fn tryAcquireWith(self: *Self, cancellation: Cancellation) error{Cancelled}!Held {
             return self.acquireFast(cancellation);
         }
 
@@ -249,4 +250,78 @@ pub fn Mutex(comptime parking_lot: type) type {
             );
         }
     };
+}
+
+test "Mutex - Serial" {
+    try testMutex(
+        Mutex(std.sync.core.with(std.sync.backend.serial).parking_lot),
+        null,
+        .{},
+    );
+}
+
+test "Mutex - Spin" {
+    const parking_lot = std.sync.core.with(std.sync.backend.spin).parking_lot;
+
+    var cancellations: [5]parking_lot.Cancellation = undefined;
+    for (cancellations) |*cc, index| {
+        cc.* = .{
+            .context = index,
+            .isCancelledFn = struct {
+                fn isCancelled(self: *parking_lot.Cancellation) bool {
+                    if (self.context == 0) return true;
+                    self.context -= 1;
+                    return false;
+                }
+            }.isCancelled,
+        };
+    }
+
+    try testMutex(
+        Mutex(parking_lot),
+        std.Thread,
+        cancellations,
+    );
+}
+
+test "Mutex - OS" {
+    const parking_lot = std.sync.core.with(std.sync.backend.os).parking_lot;
+
+    const delay = 1 * std.time.ns_per_ms;
+    const cancellations = [_]parking_lot.Cancellation{
+        .{ .Duration = delay },
+        .{ .Deadline = parking_lot.Cancellation.now() + delay },
+    };
+
+    try testMutex(
+        Mutex(parking_lot),
+        std.Thread,
+        cancellations,
+    );
+}
+
+fn testMutex(
+    comptime TestMutex: type,
+    comptime TestThread: ?type,
+    cancellations: anytype,
+) !void {
+    {
+        var mutex = TestMutex{};
+        defer if (@hasDecl(TestMutex, "deinit")) {
+            mutex.deinit();
+        };
+
+        var held = mutex.tryAcquire() orelse unreachable;
+        testing.expectEqual(mutex.tryAcquire(), null);
+        held.release();
+
+        held = mutex.acquire();
+        defer held.release();
+
+        for (cancellations) |cancellation| {
+            testing.expectError(error.Cancelled, mutex.tryAcquireWith(cancellation));
+        }
+    }
+
+    try @import("./Lock.zig").testLock(TestMutex, TestThread);
 }
