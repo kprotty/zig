@@ -39,7 +39,7 @@ pub fn ParkingLot(comptime Backend: type) type {
         pub const bucket_count: usize = if (@hasDecl(Backend, "bucket_count"))
             Backend.bucket_count
         else
-            @sizeOf(usize);
+            std.meta.bitCount(usize);
 
         // TODO: Document
         pub const Timeout: type = if (@hasDecl(Backend, "Timeout"))

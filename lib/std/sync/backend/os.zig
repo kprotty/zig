@@ -48,7 +48,7 @@ const UnhandledOsBackend = struct {
             }
         }
 
-        pub fn notify(ptr: *const u32) void {
+        pub fn notifyOne(ptr: *const u32) void {
             // no-op
         }
 
@@ -109,7 +109,7 @@ const LinuxBackend = struct {
             }
         }
 
-        pub inline fn notify(ptr: *const u32) void {
+        pub inline fn notifyOne(ptr: *const u32) void {
             return wake(ptr, 1);
         }
 
@@ -483,102 +483,9 @@ const WindowsBackend = struct {
         }
     };
 
-    /// ParkingLot.Event implementation backed by NtKeyedEvents
-    pub const Event = struct {
-        state: State,
-
-        const Self = @This();
-        const State = enum(u32) {
-            empty,
-            waiting,
-            notified,
-        };
-
-        pub fn init(self: *Self) void {
-            self.state = .empty;
-        }
-
-        pub fn deinit(self: *Self) void {
-            self.* = undefined;
-        }
-
-        pub fn reset(self: *Self) void {
-            self.state = .empty;
-        }
-
-        pub fn set(self: *Self) void {
-            switch (atomic.swap(&self.state, .notified, .Release)) {
-                .empty => return,
-                .waiting => NtKeyedEvent.wake(@ptrCast(*const u32, &self.state)),
-                .notified => unreachable, // multiple Event.set()'s performed.
-            }
-        }
-
-        pub fn wait(self: *Self, cancellation: ?*Cancellation) error{Cancelled}!void {
-            // Try to mark the event as waiting if its not set.
-            if (atomic.compareAndSwap(
-                &self.state,
-                .empty,
-                .waiting,
-                .Acquire,
-                .Acquire,
-            )) |state| {
-                assert(state == .notified);
-                return;
-            }
-
-            var timed_out = false;
-            var timeout: ?u64 = null;
-            if (cancellation) |cc| {
-                if (cc.nanoseconds()) |timeout_ns| {
-                    timeout = timeout_ns;
-                } else {
-                    timed_out = true;
-                }
-            }
-
-            if (!timed_out) {
-                NtKeyedEvent.wait(
-                    @ptrCast(*const u32, &self.state),
-                    timeout,
-                ) catch {
-                    timed_out = true;
-                };
-            }
-
-            // If we time out, we need to unmark the event as no longer waiting.
-            // If we don't, then the set() thread will block on NtKeyedEvent and deadlock.
-            //
-            // Failing to unmark the event means that the set() thread is or will do a NtKeyedEvent.wake().
-            // To prevent it from deadlocking, we do a matching NtKeyedEvent.wait() which should return almost immediately.
-            if (timed_out) {
-                const state = atomic.compareAndSwap(
-                    &self.state,
-                    .waiting,
-                    .empty,
-                    .Acquire,
-                    .Acquire,
-                ) orelse return error.Cancelled;
-                assert(state == .notified);
-                NtKeyedEvent.wait(
-                    @ptrCast(*const u32, &self.state),
-                    null,
-                ) catch unreachable;
-            }
-        }
-
-        pub fn yield(iteration: usize) bool {
-            // Uses a similar spinning strategy to the one found in kernel32's CRITICAL_SECTION.
-            // https://docs.microsoft.com/en-us/windows/win32/api/synchapi/nf-synchapi-initializecriticalsectionandspincount
-            if (iteration < 4000) {
-                atomic.spinLoopHint();
-                return true;
-            }
-
-            return false;
-        }
-    };
-
+    // Use SRWLock when available as its generally fast
+    // and windows has the opportunity to implement certain
+    // optimizations for it like priority inheritance in the future.
     pub usingnamespace if (SRWLock.is_supported)
         struct {
             pub const Lock = SRWLock;
@@ -617,104 +524,337 @@ const WindowsBackend = struct {
         };
     };
 
-    /// Windows NT Keyed Events API
-    const NtKeyedEvent = struct {
-        /// Wait on a wake() notification for a key using NtKeyedEvents.
-        pub fn wait(key: *const u32, timeout: ?u64) error{TimedOut}!void {
-            var timeout_value: windows.LARGE_INTEGER = undefined;
-            var timeout_ptr: ?*const windows.LARGE_INTEGER = null;
-
-            if (timeout) |timeout_ns| {
-                const timeout_units = @divFloor(timeout_ns, 100); // windows works with time units in 100ns
-                const timeout_unit = std.math.cast(windows.LARGE_INTEGER, timeout_units) catch std.math.maxInt(windows.LARGE_INTEGER);
-                timeout_value = -(timeout_unit); // A negative value represents relative timeout while positive is absolute.
-                timeout_ptr = &timeout_value;
-            }
-
-            switch (windows.ntdll.NtWaitForKeyedEvent(
-                getEventHandle(),
-                @ptrCast(*const c_void, key),
-                windows.FALSE, // non-alertable wait
-                timeout_ptr,
-            )) {
-                .SUCCESS => {},
-                .TIMEOUT => return error.TimedOut,
-                else => |status| {
-                    const err = windows.unexpectedStatus(status);
-                    unreachable;
-                },
-            }
-        }
-
-        /// Wake up a wait()'ing thread on the key using NtKeyedEvents.
-        /// Blocks until it finds a thread to wake up (unlike futexes).
-        pub fn wake(key: *const u32) void {
-            switch (windows.ntdll.NtReleaseKeyedEvent(
-                getEventHandle(),
-                @ptrCast(*const c_void, key),
-                windows.FALSE, // non-alertable wait
-                null,
-            )) {
-                .SUCCESS => {},
-                else => |status| {
-                    const err = windows.unexpectedStatus(status);
-                    unreachable;
-                },
-            }
-        }
-
-        var event_handle: ?windows.HANDLE = windows.INVALID_HANDLE_VALUE;
-
-        /// Get the process-wide keyed event handle (null is a valid value).
-        fn getEventHandle() ?windows.HANDLE {
-            const handle = atomic.load(&event_handle, .Relaxed);
-            if (handle != windows.INVALID_HANDLE_VALUE) {
-                return handle;
+    pub const Futex = struct {
+        pub fn wait(ptr: *const u32, expected: u32, cancellation: ?*Cancellation) error{Cancelled}!void {
+            if (WaitOnAddress.isSupported()) {
+                return WaitOnAddress.wait(ptr, expected, cancellation);
             } else {
-                return getEventHandleSlow();
+                return NtKeyedEvent.wait(ptr, expected, cancellation);
             }
         }
 
-        fn getEventHandleSlow() ?windows.HANDLE {
-            @setCold(true);
+        pub fn notifyOne(ptr: *const u32) void {
+            if (WaitOnAddress.isSupported()) {
+                return WaitOnAddress.notifyOne(ptr);
+            } else {
+                return NtKeyedEvent.notifyOne(ptr);
+            }
+        }
 
-            // Try to create a keyed event handle for this process.
-            var handle: windows.HANDLE = undefined;
-            const status = windows.ntdll.NtCreateKeyedEvent(
-                &handle,
-                windows.GENERIC_READ | windows.GENERIC_WRITE,
-                null,
-                @as(windows.ULONG, 0),
-            );
+        pub fn notifyAll(ptr: *const u32) void {
+            if (WaitOnAddress.isSupported()) {
+                return WaitOnAddress.notifyAll(ptr);
+            } else {
+                return NtKeyedEvent.notifyAll(ptr);
+            }
+        }
 
-            // If we're unable to, fallback to the global keyed event handle (null).
-            // We try to create our own in case the global handle is heavily contended by other processes.
-            //
-            // The global handle can also be obtained via NtOpenKeyedEvent(L"\KernelObjects\CritSecOutOfMemoryEvent").
-            // http://joeduffyblog.com/2006/11/28/windows-keyed-events-critical-sections-and-new-vista-synchronization-features/
-            var new_handle: ?windows.HANDLE = null;
-            if (status == .SUCCESS) {
-                new_handle = handle;
+        pub fn yield(iteration: usize) bool {
+            // Uses a similar spinning strategy to the one found in kernel32's ProcessHeap CRITICAL_SECTION.
+            // https://docs.microsoft.com/en-us/windows/win32/api/synchapi/nf-synchapi-initializecriticalsectionandspincount
+            if (iteration < 4000) {
+                atomic.spinLoopHint();
+                return true;
             }
 
-            // Try to set our process event handle if it doesn't have one.
-            const updated_handle = atomic.compareAndSwap(
-                &event_handle,
-                windows.INVALID_HANDLE_VALUE,
-                new_handle,
-                .Relaxed,
-                .Relaxed,
-            ) orelse return new_handle;
-
-            // If our process already had an event handle (another thread won the race)
-            // then we need to free our own if we created one to avoid a leak.
-            if (status == .SUCCESS) {
-                windows.CloseHandle(handle);
-            }
-
-            return updated_handle;
+            return false;
         }
     };
+
+    // A Futex implementation powered by Windows 8+ synchapi's WaitOnAddress functions.
+    const WaitOnAddress = struct {
+        var wait_ptr: WaitOnAddressFn = undefined;
+        var wake_one_ptr: WakeByAddressFn = undefined;
+        var wake_all_ptr: WakeByAddressFn = undefined;
+
+        const WakeByAddressFn = fn (
+            address: ?*const volatile c_void,
+        ) callconv(windows.WINAPI) void;
+
+        const WaitOnAddressFn = fn (
+            address: ?*const volatile c_void,
+            compare_address: ?*const c_void,
+            address_size: windows.SIZE_T,
+            timeout_ms: windows.DWORD,
+        ) callconv(windows.WINAPI) windows.BOOL;
+
+        pub fn wait(ptr: *const u32, expected: u32, cancellation: ?*Cancellation) error{Cancelled}!void {
+            var timeout_ms: windows.DWORD = windows.INFINITE;
+            if (cancellation) |cc| {
+                const timeout_ns = cc.nanoseconds() orelse return error.Cancelled;
+                timeout_ms = std.math.cast(windows.DWORD, timeout_ns / std.time.ns_per_ms) catch timeout_ms;
+            }
+
+            const status = (wait_ptr)(
+                @ptrCast(*const volatile c_void, ptr),
+                @ptrCast(*const c_void, &expected),
+                @sizeOf(@TypeOf(expected)),
+                timeout_ms,
+            );
+
+            if (status == windows.FALSE) {
+                switch (windows.kernel32.GetLastError()) {
+                    .TIMEOUT => return error.Cancelled,
+                    else => |errno| {
+                        const result = windows.unexpectedError(errno);
+                        unreachable;
+                    },
+                }
+            }
+        }
+
+        pub inline fn notifyOne(ptr: *const u32) void {
+            return (wake_one_ptr)(@ptrCast(*const volatile c_void, ptr));
+        }
+
+        pub inline fn notifyAll(ptr: *const u32) void {
+            return (wake_all_ptr)(@ptrCast(*const volatile c_void, ptr));
+        }
+
+        var state: State = .uninit;
+        const State = enum(u8) {
+            uninit,
+            supported,
+            unavailable,
+        };
+        
+        inline fn _isSupported() bool {
+            const has_api = std.Target.current.os.version_range.windows.isAtLeast(.win8) orelse false;
+            if (!has_api) {
+                return false;
+            }
+
+            return switch (atomic.load(&state, .Acquire)) {
+                .uninit => checkSupported(),
+                .supported => true,
+                .unavailable => false,
+            };
+        }
+
+        fn checkSupported() bool {
+            @setCold(true);
+
+            const is_supported = blk: {
+                // Load the DLL which has the functions
+                const dll = windows.kernel32.GetModuleHandleW(name: {
+                    // MSDN says that the functions are in kernel32.dll, but apparently they aren't...
+                    const char_name = "api-ms-win-core-synch-l1-2-0.dll";
+                    comptime var wchar_name = [_]windows.WCHAR{0} ** (char_name.len + 1);
+                    inline for (char_name.*) |char, index| {
+                        wchar_name[index] = @as(windows.WCHAR, char);
+                    }
+                    break :name &wchar_name;
+                }) orelse break :blk false;
+
+                // Load all the function pointers from the DLL
+                const _wait_ptr = windows.kernel32.GetProcAddress(dll, "WaitOnAddress") orelse break :blk false;
+                const _wake1_ptr = windows.kernel32.GetProcAddress(dll, "WakeByAddressAll") orelse break :blk false;
+                const _wake2_ptr = windows.kernel32.GetProcAddress(dll, "WakeByAddressSingle") orelse break :blk false;
+
+                // Set the function pointers using Unordered as there may be races.
+                atomic.store(&wait_ptr, @ptrCast(WaitOnAddressFn, _wait_ptr), .Unordered);
+                atomic.store(&wake_all_ptr, @ptrCast(WakeByAddressFn, _wake1_ptr), .Unordered);
+                atomic.store(&wake_one_ptr, @ptrCast(WakeByAddressFn, _wake2_ptr), .Unordered);
+                break :blk true;
+            };
+
+            const new_state = if (is_supported) State.supported else .unavailable;
+            atomic.store(&state, new_state, .Release);
+            return is_supported;
+        }
+    };
+
+    // A Futex implementation powered by Windows XP+ Keyed Events.
+    const NtKeyedEvent = std.sync.core.with(struct {
+        pub usingnamespace WindowsBackend;
+        pub const Event = struct {
+            state: State,
+
+            // State must be 4-byte aligned for NtKeyedEvent functions
+            const Self = @This();
+            const State = enum(u32) {
+                empty,
+                waiting,
+                notified,
+            };
+
+            pub fn init(self: *Self) void {
+                self.state = .empty;
+            }
+
+            pub fn deinit(self: *Self) void {
+                self.* = undefined;
+            }
+
+            pub fn reset(self: *Self) void {
+                self.state = .empty;
+            }
+
+            pub fn set(self: *Self) void {
+                switch (atomic.swap(&self.state, .notified, .Release)) {
+                    .empty => return,
+                    .waiting => KeyedEvent.wake(@ptrCast(*const u32, &self.state)),
+                    .notified => unreachable, // multiple Event.set()'s performed.
+                }
+            }
+
+            pub fn wait(self: *Self, cancellation: ?*Cancellation) error{Cancelled}!void {
+                // Try to mark the event as waiting if its not set.
+                if (atomic.compareAndSwap(
+                    &self.state,
+                    .empty,
+                    .waiting,
+                    .Acquire,
+                    .Acquire,
+                )) |state| {
+                    assert(state == .notified);
+                    return;
+                }
+
+                var timed_out = false;
+                var timeout: ?u64 = null;
+                if (cancellation) |cc| {
+                    if (cc.nanoseconds()) |timeout_ns| {
+                        timeout = timeout_ns;
+                    } else {
+                        timed_out = true;
+                    }
+                }
+
+                if (!timed_out) {
+                    KeyedEvent.wait(
+                        @ptrCast(*const u32, &self.state),
+                        timeout,
+                    ) catch {
+                        timed_out = true;
+                    };
+                }
+
+                // If we time out, we need to unmark the event as no longer waiting.
+                // If we don't, then the set() thread will block on NtKeyedEvent and deadlock.
+                //
+                // Failing to unmark the event means that the set() thread is or will do a NtKeyedEvent.wake().
+                // To prevent it from deadlocking, we do a matching NtKeyedEvent.wait() which should return almost immediately.
+                if (timed_out) {
+                    const state = atomic.compareAndSwap(
+                        &self.state,
+                        .waiting,
+                        .empty,
+                        .Acquire,
+                        .Acquire,
+                    ) orelse return error.Cancelled;
+                    assert(state == .notified);
+                    KeyedEvent.wait(
+                        @ptrCast(*const u32, &self.state),
+                        null,
+                    ) catch unreachable;
+                }
+            }
+
+            pub fn yield(iteration: usize) bool {
+                return WindowsBackend.Futex.yield(iteration);
+            }
+
+            /// Windows NT Keyed Events API
+            const KeyedEvent = struct {
+                /// Wait on a wake() notification for a key using Keyed Events.
+                pub fn wait(key: *const u32, timeout: ?u64) error{TimedOut}!void {
+                    var timeout_value: windows.LARGE_INTEGER = undefined;
+                    var timeout_ptr: ?*const windows.LARGE_INTEGER = null;
+
+                    if (timeout) |timeout_ns| {
+                        const timeout_units = @divFloor(timeout_ns, 100); // windows works with time units in 100ns
+                        const timeout_unit = std.math.cast(windows.LARGE_INTEGER, timeout_units) catch std.math.maxInt(windows.LARGE_INTEGER);
+                        timeout_value = -(timeout_unit); // A negative value represents relative timeout while positive is absolute.
+                        timeout_ptr = &timeout_value;
+                    }
+
+                    switch (windows.ntdll.NtWaitForKeyedEvent(
+                        getEventHandle(),
+                        @ptrCast(*const c_void, key),
+                        windows.FALSE, // non-alertable wait
+                        timeout_ptr,
+                    )) {
+                        .SUCCESS => {},
+                        .TIMEOUT => return error.TimedOut,
+                        else => |status| {
+                            const err = windows.unexpectedStatus(status);
+                            unreachable;
+                        },
+                    }
+                }
+
+                /// Wake up a wait()'ing thread on the key using NtKeyedEvents.
+                /// Blocks until it finds a thread to wake up (unlike futexes).
+                pub fn wake(key: *const u32) void {
+                    switch (windows.ntdll.NtReleaseKeyedEvent(
+                        getEventHandle(),
+                        @ptrCast(*const c_void, key),
+                        windows.FALSE, // non-alertable wait
+                        null,
+                    )) {
+                        .SUCCESS => {},
+                        else => |status| {
+                            const err = windows.unexpectedStatus(status);
+                            unreachable;
+                        },
+                    }
+                }
+
+                var event_handle: ?windows.HANDLE = windows.INVALID_HANDLE_VALUE;
+
+                /// Get the process-wide keyed event handle (null is a valid value).
+                fn getEventHandle() ?windows.HANDLE {
+                    const handle = atomic.load(&event_handle, .Relaxed);
+                    if (handle != windows.INVALID_HANDLE_VALUE) {
+                        return handle;
+                    } else {
+                        return getEventHandleSlow();
+                    }
+                }
+
+                fn getEventHandleSlow() ?windows.HANDLE {
+                    @setCold(true);
+
+                    // Try to create a keyed event handle for this process.
+                    var handle: windows.HANDLE = undefined;
+                    const status = windows.ntdll.NtCreateKeyedEvent(
+                        &handle,
+                        windows.GENERIC_READ | windows.GENERIC_WRITE,
+                        null,
+                        @as(windows.ULONG, 0),
+                    );
+
+                    // If we're unable to, fallback to the global keyed event handle (null).
+                    // We try to create our own in case the global handle is heavily contended by other processes.
+                    //
+                    // The global handle can also be obtained via NtOpenKeyedEvent(L"\KernelObjects\CritSecOutOfMemoryEvent").
+                    // http://joeduffyblog.com/2006/11/28/windows-keyed-events-critical-sections-and-new-vista-synchronization-features/
+                    var new_handle: ?windows.HANDLE = null;
+                    if (status == .SUCCESS) {
+                        new_handle = handle;
+                    }
+
+                    // Try to set our process event handle if it doesn't have one.
+                    const updated_handle = atomic.compareAndSwap(
+                        &event_handle,
+                        windows.INVALID_HANDLE_VALUE,
+                        new_handle,
+                        .Relaxed,
+                        .Relaxed,
+                    ) orelse return new_handle;
+
+                    // If our process already had an event handle (another thread won the race)
+                    // then we need to free our own if we created one to avoid a leak.
+                    if (status == .SUCCESS) {
+                        windows.CloseHandle(handle);
+                    }
+
+                    return updated_handle;
+                }
+            };
+        };
+    }).Futex;
 };
 
 /// A ParkingLot Timeout implementation which expires around every 1ms according to the OS.
