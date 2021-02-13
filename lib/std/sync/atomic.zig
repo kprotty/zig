@@ -18,24 +18,53 @@ const AtomicBitOp = enum {
     Toggle,
 };
 
-pub fn supports(comptime Int: type) bool {
-    if (std.meta.activeTag(@typeInfo(Int)) != .Int) {
-        return false;
-    }
+/// Returns true if the current platform supports most atomic operations on a given type.
+pub fn supports(comptime Type: type) bool {
+    const Int = @Type(builtin.TypeInfo{
+        .Int = switch (@typeInfo(Type)) {
+            .Bool => return true,
+            .Int => |int_info| int_info,
+            .Enum => |enum_info| blk: {
+                const tag_type = info.tag_type;
+                if (std.meta.activeTag(@typeInfo(tag_type)) != .Int) {
+                    return false;
+                } else {
+                    break :blk tag_type;
+                }
+            },
+            .Pointer => |ptr_info| {
+                // TODO: add support for atomic volatile operations in Zig's codegen backend.
+                // LLVM Example: https://zig.godbolt.org/z/46xbce
+                if (ptr_info.is_volatile) {
+                    return false;
+                }
 
+                // Atomic operations on slices themselves are ambiguous
+                if (ptr_info.size == .Slice) {
+                    return false;
+                }
+
+                // Assume that all platforms zig cares about support pointer-width atomics.
+                // TODO: Verify if this is correct.
+                return true;
+            },
+            else => return false,
+        },
+    });
+
+    // Assume that there are no platforms with non power-of-two atomic/memory accesses.
+    // TODO: Verify if this is correct.
     if (!std.math.isPowerOfTwo(std.meta.bitCount(Int))) {
         return false;
     }
 
+    // Assume that only up-to usize-width integer operations are atomic for most operations.
+    // TODO: Verify if this is correct.
     if (@sizeOf(Int) > @sizeOf(usize)) {
-        const is_x86 = std.builtin.arch == .i386 or .arch == .x86_64;
-        if (!(is_x86 and @sizeOf(Int) == @sizeOf(usize) * 2)) {
-            return false;
-        }
+        return false;
     }
 
-    // TODO: return false for some ARM platforms
-
+    // TODO: return false for some ARM/RISCV/MIPS/Z80 platforms
     return true;
 }
 
@@ -47,26 +76,35 @@ test "supports" {
     }
 }
 
+/// Hints to the CPU that the caller is free to schedule any other work internally.
+/// This generally means that the current CPU core has the option to switch "hardware threads".
 pub fn spinLoopHint() void {
+    comptime var instruction: []const u8 = "";
+
+    // TODO: ARM Thumb v7 supports "yield"
     switch (builtin.arch) {
-        .i386, .x86_64 => asm volatile ("pause"
-            :
-            :
-            : "memory"
-        ),
-        .arm, .aarch64 => asm volatile ("yield"
-            :
-            :
-            : "memory"
-        ),
+        .aarch64 => "yield",
+        .i386, .x86_64 => instruction = "pause",
         else => {},
     }
+
+    asm volatile (instruction
+        :
+        :
+        : "memory"
+    );
 }
 
 test "spinLoopHint" {
     spinLoopHint();
 }
 
+/// Atomic memory orderings are used to bound internal transformations done by
+/// both the compiler and the hardware when it comes to reordering memory instructions.
+///
+/// The current set of atomic memory orderings are based on LLVM/C11's atomic memory model.
+/// https://llvm.org/docs/Atomics.html
+/// https://en.cppreference.com/w/cpp/atomic/memory_order
 pub const Ordering = enum {
     Unordered,
     Relaxed,
@@ -89,11 +127,13 @@ pub const Ordering = enum {
     }
 };
 
-pub fn fence(comptime ordering: Ordering) void {
+/// Introduce a lexical compiler and hardware reodering restriction using the given atomic memory ordering.
+pub inline fn fence(comptime ordering: Ordering) void {
     @fence(comptime ordering.toBuiltin());
 }
 
-pub fn compilerFence(comptime ordering: Ordering) void {
+/// Introduce a lexical compiler only reordering restriction using the given atomic memory ordering.
+pub inline fn compilerFence(comptime ordering: Ordering) void {
     switch (ordering) {
         .Unordered => @compileError("Unordered memory ordering can only be on atomic variables"),
         .Relaxed => @compileError("Relaxed memory ordering can only be on atomic variables"),

@@ -111,7 +111,7 @@ pub fn milliTimestamp() i64 {
 /// The return value is signed due to possibly being behind the UTC epoch.
 pub fn nanoTimestamp() i128 {
     return Clock.System.read() orelse blk: {
-        break :blk 0; /// Precision of timing depends on the hardware and operating system.
+        break :blk 0; // Precision of timing depends on the hardware and operating system.
     };
 }
 
@@ -258,7 +258,7 @@ test "now" {
     testing.expect(time_2 >= time_0);
 }
 
-const Clock = enum {
+pub const Clock = enum {
     /// A precise clock is one which has nanosecond precision.
     /// Any other properties such as performance or being monotonic are not guaranteed. 
     Precise,
@@ -355,7 +355,7 @@ const Clock = enum {
                 var bias: u64 = undefined;
                 var frequency_mul: u64 = undefined;
                 var frequency_div: ?u64 = undefined;
-                var init_once = std.Thread.Once(init){};
+                var init_once = std.Thread.Once{};
 
                 fn init() void {
                     bias = os.windows.QueryPerformanceCounter();
@@ -378,7 +378,7 @@ const Clock = enum {
                 }
             };
 
-            Static.init_once.call();
+            Static.init_once.call(Static.init);
 
             var value = os.windows.QueryPerformanceCounter();
             value -%= Static.bias;
