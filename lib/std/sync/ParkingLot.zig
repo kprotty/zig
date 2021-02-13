@@ -117,12 +117,12 @@ pub fn ParkingLot(comptime config: anytype) type {
         pub fn park(
             address: usize,
             cancellation: ?WaitEvent.Cancellation,
-            callback: anytype, 
-        ) error{Invalidated, Cancelled}!Token {
+            callback: anytype,
+        ) error{ Invalidated, Cancelled }!Token {
             var node: WaitNode = undefined;
-            
+
             {
-                // Then grab the WaitBucket lock for this address in order to 
+                // Then grab the WaitBucket lock for this address in order to
                 // prepare for an enqueue & synchronize with unpark()
                 var held: WaitLock.Held = undefined;
                 const bucket = WaitBucket.from(address);
@@ -130,7 +130,7 @@ pub fn ParkingLot(comptime config: anytype) type {
                 defer bucket.release(&held);
 
                 // Update the wait count for the bucket before calling the onValidate() function below.
-                // If done after, then an unpark() thread could see waiters = 0, 
+                // If done after, then an unpark() thread could see waiters = 0,
                 // after we validate the wait but before enqueue to wait,
                 // causing this waiter to miss an unpark() notification.
                 _ = atomic.fetchAdd(&bucket.waiters, 1, .SeqCst);
@@ -193,7 +193,7 @@ pub fn ParkingLot(comptime config: anytype) type {
                         _ = atomic.fetchSub(&bucket.waiters, 1, .SeqCst);
                         var queue = bucket.queue(addr);
                         queue.remove(&node);
-                        
+
                         callback.onCancel(Unparked{
                             .token = node.token,
                             .has_more = !queue.isEmpty(),
@@ -253,7 +253,7 @@ pub fn ParkingLot(comptime config: anytype) type {
             const FilterCallback = struct {
                 callback: Callback,
                 called_unparked: bool = false,
-                
+
                 pub fn onFilter(self: *@This(), waiter: Waiter) Filtered {
                     if (self.called_unparked) {
                         return .Stop;
@@ -275,7 +275,7 @@ pub fn ParkingLot(comptime config: anytype) type {
                     }
                 }
             };
-            
+
             var filter_callback = FilterCallback{ .callback = callback };
             unparkFilter(address, &filter_callback);
         }
@@ -338,7 +338,7 @@ pub fn ParkingLot(comptime config: anytype) type {
                 _ = atomic.fetchSub(&bucket.waiters, unparked.len, .SeqCst);
             }
 
-            // Before we wake up the waiters, 
+            // Before we wake up the waiters,
             // call the `onBeforeWake()` callback with the WaitBucket locked.
             callback.onBeforeWake();
         }
@@ -394,7 +394,7 @@ pub fn ParkingLot(comptime config: anytype) type {
             const requeue_op: Requeued = callback.onRequeue() orelse return;
             var max_requeue = requeue_op.requeue;
             var max_unpark = requeue_op.unpark;
-            
+
             // Push the amount of unparked WaitNodes into the unparked WaitList.
             var queue = bucket.queue(address);
             while (max_unpark > 0) : (max_unpark -= 1) {
@@ -521,7 +521,7 @@ pub fn ParkingLot(comptime config: anytype) type {
                 node.prev = null;
                 node.tail = node;
                 node.parent = self.parent;
-                node.children = [_]?*WaitNode{null, null};
+                node.children = [_]?*WaitNode{ null, null };
                 node.ticket = self.bucket.genPrng(u16) | 1;
 
                 // Insert the node into the tree and re-balance it by ticket.
@@ -625,13 +625,13 @@ pub fn ParkingLot(comptime config: anytype) type {
             waiters: usize = 0,
             root: usize = 0,
             timestamp: FairTimestamp = FairTimestamp{},
-            
+
             const IS_ROOT_PRNG: usize = 0b01;
             const IS_BUCKET_LOCKED: usize = 0b10;
             const ROOT_NODE_MASK = ~@as(usize, IS_ROOT_PRNG | IS_BUCKET_LOCKED);
             const PRNG_SHIFT = @popCount(std.math.Log2Int(usize), ~ROOT_NODE_MASK);
 
-            var array = [_]WaitBucket{WaitBucket{}} ** std.math.max(1, wait_bucket_count); 
+            var array = [_]WaitBucket{WaitBucket{}} ** std.math.max(1, wait_bucket_count);
 
             /// Hash an address into a WaitBucket reference.
             pub fn from(address: usize) *WaitBucket {
@@ -734,7 +734,7 @@ pub fn ParkingLot(comptime config: anytype) type {
 
                 self.setPrng(prng);
                 return @bitCast(Int, rng_parts);
-            } 
+            }
 
             fn didTimestampExpire(self: *WaitBucket) bool {
                 assert(self.root & IS_BUCKET_LOCKED != 0);
@@ -743,7 +743,7 @@ pub fn ParkingLot(comptime config: anytype) type {
                 if (!self.timestamp.expires(now)) {
                     return false;
                 }
-                
+
                 const rng = self.genPrng(u64);
                 self.timestamp.update(now, rng);
                 return true;
@@ -765,7 +765,7 @@ pub const DefaultTimestamp = struct {
         return false;
     }
 
-    pub fn update(self: *Self, timestamp: Self, rng: u64) {
+    pub fn update(self: *Self, timestamp: Self, rng: u64) void {
         // no-op
     }
 };
@@ -813,7 +813,7 @@ pub fn DefaultLock(comptime Event: type) type {
         // True when the target is in the class of x86 chips, false otherwise.
         // This is used to select certain cpu instructions for the occasion.
         const is_x86 = std.builtin.arch == .i386 or .arch == .x86_64;
-        
+
         // True if the target supports atomic operations of different sizes on the same address.
         // Ive only ever observed this to be false on obscure platforms like Itanium [1], which Zig doesn't seem to target yet.
         // [1]: (IA64 Vol 3A, Section 8.1.2.2) https://www.intel.com/content/dam/www/public/us/en/documents/manuals/64-ia-32-architectures-software-developer-vol-3a-part-1-manual.pdf
@@ -832,7 +832,7 @@ pub fn DefaultLock(comptime Event: type) type {
             event: Event align(std.math.max(@alignOf(Event), ~WAITING + 1)),
         };
 
-        pub const Held = void;        
+        pub const Held = void;
 
         /// Try to acquire the Lock, using the passed in state as the assume current value.
         /// Uses Acquire memory ordering on success to see changes release()'d by last lock holder.
@@ -898,7 +898,7 @@ pub fn DefaultLock(comptime Event: type) type {
                     // If we failed to acquire the lock, yield the processor a little bit.
                     // The goal here is to reduce contention on the state, assuming theres other fast processors.
                     if (Event.yield(adaptive_spin)) {
-                        adaptive_spin +%= 1;   
+                        adaptive_spin +%= 1;
                     } else {
                         atomic.spinLoopHint();
                     }
@@ -955,7 +955,7 @@ pub fn DefaultLock(comptime Event: type) type {
         pub fn release(self: *Self, held: *Held) void {
             var state: usize = undefined;
             var should_wake: bool = undefined;
-            
+
             // Drop ownership of the lock by unsetting the LOCKED bit.
             // If byte-ops are available, we can use an atomic store instead of an rmw op
             // since the entire LSB byte is reserved for the LOCKED bit.
@@ -990,7 +990,7 @@ pub fn DefaultLock(comptime Event: type) type {
                 if ((state & WAITING == 0) or (state & (LOCKED | WAKING) != 0)) {
                     return;
                 }
-                
+
                 // Acquire barrier on success which is needed to make visible the waiter.field
                 // writes that were Release'd by the waiter when it enqueued itself.
                 state = atomic.tryCompareAndSwap(
@@ -1034,7 +1034,7 @@ pub fn DefaultLock(comptime Event: type) type {
 
                 // If the Lock is currently owned, we should leave the wake-up to that thread instead.
                 // For that, we unset the WAKING bit so that thread's eventual releaseSlow() can do the wake up.
-                // 
+                //
                 // On success, we need a Release barrier to ensure the next WAKING thread sees the writes when searching for tail we did above.
                 // On failure, we need an Acquire barrier to see the writes to any new Waiters that enqueued themselves as the head.
                 if (state & LOCKED != 0) {
@@ -1047,7 +1047,7 @@ pub fn DefaultLock(comptime Event: type) type {
                     ) orelse return;
                     continue;
                 }
-                
+
                 // If the tail isn't the last waiter in the queue,
                 // then we dequeue it normally by logically detaching it from the doubly linked list.
                 //
@@ -1073,7 +1073,7 @@ pub fn DefaultLock(comptime Event: type) type {
                         tail.event.set();
                         return;
                     };
-                    
+
                     // If a new waiter added itself while we were trying to zero out the wait queue state
                     // then we need to retry the dequeue since the new waiter now references the tail.
                     // Acquire barrier here in order to ensure we see the waiter writes when we loop back above.

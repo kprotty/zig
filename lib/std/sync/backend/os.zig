@@ -33,7 +33,7 @@ const UnhandledOsBackend = struct {
     // Futex implementation which blocks via std.time.sleep()
     pub const Futex = struct {
         pub fn wait(ptr: *const u32, expected: u32, cancellation: ?*Cancellation) error{Cancelled}!void {
-             while (true) {
+            while (true) {
                 if (atomic.load(ptr, .SeqCst) != expected) {
                     return;
                 }
@@ -68,7 +68,7 @@ const LinuxBackend = struct {
     // We use tree based lookup in ParkingLot instead of the linked list traversal
     // employed in the linux kernel which should account for the smaller bucket size.
     pub const bucket_count = 256;
-    
+
     // Use the generic OS timing facilities
     pub const Timeout = OsTimeout;
     pub const Cancellation = OsCancellation;
@@ -135,7 +135,7 @@ const LinuxBackend = struct {
         }
 
         pub fn yield(iteration: usize) bool {
-            // Don't spin on low-power devices as the potential 
+            // Don't spin on low-power devices as the potential
             // smaller latency there is not worth the power draw.
             switch (builtin.arch) {
                 .i386, .x86_64 => {},
@@ -209,12 +209,12 @@ const DarwinBackend = struct {
         }
 
         pub fn yield(iteration: usize) bool {
-            // Don't spin on the mobile platforms like iOS and watchOS 
+            // Don't spin on the mobile platforms like iOS and watchOS
             // as battery and avoiding priority inversion are worth more there.
             if (builtin.os.tag != .macos) {
                 return false;
             }
-            
+
             // After benchmarking on M1/BigSur, this appears to be a decent spin count for various cases.
             if (iteration < 4) {
                 var spin = @as(usize, 8) << @intCast(std.math.Log2Int(usize), iteration);
@@ -227,19 +227,20 @@ const DarwinBackend = struct {
     };
 
     // Use os_unfair_lock when available over the default parking_lot.Lock
-    // as this internally implements priority inheritance and is 
-    // just as fast uncontended but slightly slower contended. 
+    // as this internally implements priority inheritance and is
+    // just as fast uncontended but slightly slower contended.
     pub usingnamespace if (OsUnfairLock.is_supported)
         struct {
             pub const Lock = OsUnfairLock;
-            
+
             // Don't use os_unfair_lock for user-facing core.Lock implementation
             // as the former provides less throughput on average since it is not
             // guaranteed to, nor does it currently, employ adaptive spinning.
-            // 
+            //
             // pub const CoreLock = OsUnfairLock;
         }
-    else struct {};
+    else
+        struct {};
 
     const OsUnfairLock = struct {
         oul: darwin.os_unfair_lock = darwin.OS_UNFAIR_LOCK_INIT,
@@ -292,7 +293,7 @@ const PosixBackend = struct {
         state: State,
         cond: c.pthread_cond_t,
         mutex: c.pthread_mutex_t,
-        
+
         const c = std.c;
         const Self = @This();
         const State = enum {
@@ -313,8 +314,8 @@ const PosixBackend = struct {
             // On some BSD's like DragonflyBSD or NetBSD,
             // calling the _destroy() functions without using one of their methods
             // can result in it returning EINVAL from the _INITIALIZER constants.
-            assertIn(c.pthread_mutex_destroy(&self.mutex), .{0, std.os.EINVAL});
-            assertIn(c.pthread_cond_destroy(&self.cond), .{0, std.os.EINVAL});
+            assertIn(c.pthread_mutex_destroy(&self.mutex), .{ 0, std.os.EINVAL });
+            assertIn(c.pthread_cond_destroy(&self.cond), .{ 0, std.os.EINVAL });
         }
 
         pub fn reset(self: *Self) void {
@@ -324,7 +325,7 @@ const PosixBackend = struct {
         pub fn set(self: *Self) void {
             assertIn(c.pthread_mutex_lock(&self.mutex), .{0});
             defer assertIn(c.pthread_mutex_unlock(&self.mutex), .{0});
-        
+
             switch (self.state) {
                 .empty => {
                     self.state = .notified;
@@ -368,7 +369,7 @@ const PosixBackend = struct {
                 const timeout = cc.nanoseconds() orelse return error.Cancelled;
                 var timespec = timespecAfter(timeout);
                 const rc = c.pthread_cond_timedwait(&self.cond, &self.mutex, &timespec);
-                assertIn(rc, .{0, std.os.ETIMEDOUT});
+                assertIn(rc, .{ 0, std.os.ETIMEDOUT });
             }
         }
 
@@ -414,7 +415,7 @@ const PosixBackend = struct {
                     ts.tv_nsec = std.time.ns_per_s - 1;
                 };
             }
-            
+
             // Add the timeout seconds to ts.tv_sec, saturating on overflow
             const tm_secs = std.math.cast(Sec, timeout / std.time.ns_per_s) catch std.math.maxInt(Sec);
             if (@addWithOverflow(Sec, ts.tv_sec, tm_secs, &ts.tv_sec)) {
@@ -495,7 +496,8 @@ const WindowsBackend = struct {
             pub const Lock = SRWLock;
             pub const CoreLock = SRWLock;
         }
-    else struct {};
+    else
+        struct {};
 
     const SRWLock = struct {
         srwlock: windows.SRWLOCK = windows.SRWLOCK_INIT,
@@ -521,7 +523,7 @@ const WindowsBackend = struct {
 
         pub const Held = struct {
             srwlock: *windows.SRWLOCK,
-            
+
             pub fn release(self: Held) void {
                 windows.kernel32.ReleaseSRWLockExclusive(self.srwlock);
             }
@@ -621,7 +623,7 @@ const WindowsBackend = struct {
             supported,
             unavailable,
         };
-        
+
         inline fn isSupported() bool {
             const has_api = std.Target.current.os.version_range.windows.isAtLeast(.win8) orelse false;
             if (!has_api) {
@@ -866,7 +868,7 @@ const OsTimeout = struct {
     expires: u64 = 0,
 
     pub fn beFair(self: *OsTimeout, fair_rng: u64) bool {
-        // Use std.time.Clock.Precise instead of std.time.now() 
+        // Use std.time.Clock.Precise instead of std.time.now()
         // since we don't really need the monotonic property here.
         const now = std.time.Clock.Precise.read() orelse 0;
         if (now < self.expires) {

@@ -128,12 +128,12 @@ pub const Ordering = enum {
 };
 
 /// Introduce a lexical compiler and hardware reodering restriction using the given atomic memory ordering.
-pub inline fn fence(comptime ordering: Ordering) void {
+pub fn fence(comptime ordering: Ordering) callconv(.Inline) void {
     @fence(comptime ordering.toBuiltin());
 }
 
 /// Introduce a lexical compiler only reordering restriction using the given atomic memory ordering.
-pub inline fn compilerFence(comptime ordering: Ordering) void {
+pub fn compilerFence(comptime ordering: Ordering) callconv(.Inline) void {
     switch (ordering) {
         .Unordered => @compileError("Unordered memory ordering can only be on atomic variables"),
         .Relaxed => @compileError("Relaxed memory ordering can only be on atomic variables"),
@@ -254,7 +254,13 @@ test "fetchXor" {
     }
 }
 
-inline fn atomicRmw(comptime T: type, ptr: *T, comptime op: AtomicRmwOp, value: T, comptime ordering: Ordering) T {
+fn atomicRmw(
+    comptime T: type,
+    ptr: *T,
+    comptime op: AtomicRmwOp,
+    value: T,
+    comptime ordering: Ordering,
+) callconv(.Inline) T {
     return @atomicRmw(T, ptr, op, value, comptime ordering.toBuiltin());
 }
 

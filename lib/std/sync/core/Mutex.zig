@@ -227,7 +227,7 @@ pub fn Mutex(comptime parking_lot: type) type {
                 pub fn onUnpark(unparker: @This(), unparked: parking_lot.Unparked) parking_lot.Token {
                     const mutex = unparker.mutex;
                     const be_fair = unparker.be_fair or unparked.be_fair;
-                    
+
                     if (unparked.token != null and be_fair) {
                         if (!unparked.has_more) {
                             atomic.store(&mutex.state, LOCKED, .Relaxed);

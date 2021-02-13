@@ -74,7 +74,7 @@ pub fn FutexLock(
 
         fn acquireSlow(self: *Self, current_state: State, _cancellation: ?Cancellation) error{Cancelled}!void {
             @setCold(true);
-            
+
             var adaptive_spin: usize = 0;
             var new_state = current_state;
             var cancellation = _cancellation;

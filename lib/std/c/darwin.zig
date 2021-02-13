@@ -247,7 +247,7 @@ pub extern "c" fn os_unfair_lock_assert_not_owner(lock: os_unfair_lock_t) void;
 
 pub const os_ulock_value_t = os_lock_owner_t;
 pub const OS_ULOCK_NOWAITERS_BIT = 1;
-pub inline fn OS_ULOCK_OWNER(value: os_ulock_value_t) os_lock_owner_t {
+pub fn OS_ULOCK_OWNER(value: os_ulock_value_t) callconv(.Inline) os_lock_owner_t {
     return value | OS_ULOCK_NOWAITERS_BIT;
 }
 

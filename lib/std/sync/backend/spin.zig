@@ -10,7 +10,7 @@ const atomic = @import("../atomic.zig");
 // The only way spinning can cancel is by polling.
 pub const Cancellation = struct {
     context: usize,
-    isCancelledFn: fn(*Cancellation) bool,
+    isCancelledFn: fn (*Cancellation) bool,
 };
 
 // Futex implementation which blocks via std.time.sleep()

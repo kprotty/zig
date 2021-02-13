@@ -38,7 +38,7 @@ pub fn Once(comptime parking_lot: type) type {
 
         fn wait(self: *Self, current_state: State, initFn: anytype) void {
             @setCold(true);
-            
+
             var state = current_state;
             while (state == .uninit) {
                 if (atomic.tryCompareAndSwap(

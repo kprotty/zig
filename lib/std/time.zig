@@ -142,11 +142,11 @@ pub const Timer = struct {
         return Timer{ .start_time = start_time };
     }
 
-    inline fn readClock(self: Timer) u64 {
+    fn readClock(self: Timer) callconv(.Inline) u64 {
         return Clock.Precise.read() orelse self.start_time;
     }
 
-    inline fn toRelative(self: Timer, clock_reading: u64) u64 {
+    fn toRelative(self: Timer, clock_reading: u64) callconv(.Inline) u64 {
         const clock_time = std.math.max(clock_reading, self.start_time);
         return clock_time - self.start_time;
     }

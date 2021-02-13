@@ -341,7 +341,7 @@ pub fn ParkingLot(comptime Backend: type) type {
                 if (helgrind) |hg| {
                     hg.annotateHappensBefore(address);
                 }
-                
+
                 while (unparked.pop()) |node| {
                     node.event.set();
                 }

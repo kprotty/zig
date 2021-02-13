@@ -89,7 +89,7 @@ pub fn testLock(
     }
 
     const Thread = TestThread orelse return;
-    
+
     const allocator = std.heap.page_allocator;
     const Contention = struct {
         index: usize = 0,

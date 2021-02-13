@@ -54,7 +54,7 @@ pub fn FutexEvent(
             defer if (helgrind) |hg| {
                 hg.annotateHappensAfter(@ptrToInt(self));
             };
-            
+
             if (atomic.compareAndSwap(
                 &self.state,
                 .empty,
