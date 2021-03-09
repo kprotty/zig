@@ -14,7 +14,7 @@ const helgrind: ?type = if (builtin.valgrind_support) std.valgrind.helgrind else
 pub fn Futex(comptime Event: type) type {
     return struct {
         const WaitLock = Event.Lock;
-        const bucket_count = Event.bucket_count;
+        const bucket_count = if (@hasDecl(Event, "bucket_count")) Event.bucket_count else 1024;
 
         const WaitBucket = struct {
             lock: WaitLock = .{},
