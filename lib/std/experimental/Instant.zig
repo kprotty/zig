@@ -153,7 +153,7 @@ const PosixClock = struct {
     fn read() u64 {
         var ts: std.os.timespec = undefined;
         std.os.clock_gettime(std.os.CLOCK_MONOTONIC, &ts) catch return 0;
-        return (@as(u64, ts.tv_sec) * std.time.ns_per_s) + @as(u64, ts.tv_nsec);
+        return (@intCast(u64, ts.tv_sec) * std.time.ns_per_s) + @intCast(u64, ts.tv_nsec);
     }
 
     fn toDuration(delta: u64) u64 {

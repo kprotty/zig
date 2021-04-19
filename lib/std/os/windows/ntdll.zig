@@ -100,14 +100,14 @@ pub extern "NtDll" fn NtCreateKeyedEvent(
     Flags: ULONG,
 ) callconv(WINAPI) NTSTATUS;
 pub extern "NtDll" fn NtReleaseKeyedEvent(
-    EventHandle: HANDLE,
-    Key: *const c_void,
+    EventHandle: ?HANDLE,
+    Key: ?*const c_void,
     Alertable: BOOLEAN,
     Timeout: ?*LARGE_INTEGER,
 ) callconv(WINAPI) NTSTATUS;
 pub extern "NtDll" fn NtWaitForKeyedEvent(
-    EventHandle: HANDLE,
-    Key: *const c_void,
+    EventHandle: ?HANDLE,
+    Key: ?*const c_void,
     Alertable: BOOLEAN,
     Timeout: ?*LARGE_INTEGER,
 ) callconv(WINAPI) NTSTATUS;
@@ -120,4 +120,19 @@ pub extern "NtDll" fn NtQueryObject(
     ObjectInformation: PVOID,
     ObjectInformationLength: ULONG,
     ReturnLength: ?*ULONG,
+) callconv(WINAPI) NTSTATUS;
+
+pub extern "NtDll" fn RtlWakeAddressAll(
+    Address: ?*const c_void,
+) callconv(WINAPI) void;
+
+pub extern "NtDll" fn RtlWakeAddressSingle(
+    Address: ?*const c_void,
+) callconv(WINAPI) void;
+
+pub extern "NtDll" fn RtlWaitOnAddress(
+    Address: ?*const c_void,
+    CompareAddress: ?*const c_void,
+    AddressSize: SIZE_T,
+    Timeout: ?*const LARGE_INTEGER,
 ) callconv(WINAPI) NTSTATUS;

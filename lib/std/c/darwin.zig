@@ -200,9 +200,40 @@ pub const dispatch_semaphore_t = *opaque {};
 pub const dispatch_time_t = u64;
 pub const DISPATCH_TIME_NOW = @as(dispatch_time_t, 0);
 pub const DISPATCH_TIME_FOREVER = ~@as(dispatch_time_t, 0);
+
 pub extern "c" fn dispatch_semaphore_create(value: isize) ?dispatch_semaphore_t;
 pub extern "c" fn dispatch_semaphore_wait(dsema: dispatch_semaphore_t, timeout: dispatch_time_t) isize;
 pub extern "c" fn dispatch_semaphore_signal(dsema: dispatch_semaphore_t) isize;
 
 pub extern "c" fn dispatch_release(object: *c_void) void;
 pub extern "c" fn dispatch_time(when: dispatch_time_t, delta: i64) dispatch_time_t;
+
+// Undocumented futex-like API available on darwin 16+
+// (macOS 10.12+, iOS 10.0+, tvOS 10.0+, watchOS 3.0+, catalyst 13.0+).
+//
+// [ulock.h]: https://github.com/apple/darwin-xnu/blob/master/bsd/sys/ulock.h
+// [sys_ulock.c]: https://github.com/apple/darwin-xnu/blob/master/bsd/kern/sys_ulock.c
+
+pub const UL_COMPARE_AND_WAIT = 1;
+pub const UL_UNFAIR_LOCK = 2;
+
+// Obsolete/deprecated
+pub const UL_OSSPINLOCK = UL_COMPARE_AND_WAIT;
+pub const UL_HANDOFFLOCK = UL_UNFAIR_LOCK;
+
+pub const ULF_WAKE_ALL = 0x100;
+pub const ULF_WAKE_THREAD = 0x200;
+pub const ULF_WAIT_WORKQ_DATA_CONTENTION = 0x10000;
+pub const ULF_WAIT_CANCEL_POINT = 0x20000;
+pub const ULF_NO_ERRNO = 0x1000000;
+
+// The following are only supported on darwin 19+
+// (macOS 10.15+, iOS 13.0+)
+pub const UL_COMPARE_AND_WAIT_SHARED = 3;
+pub const UL_UNFAIR_LOCK64_SHARED = 4;
+pub const UL_COMPARE_AND_WAIT64 = 5;
+pub const UL_COMPARE_AND_WAIT64_SHARED = 6;
+pub const ULF_WAIT_ADAPTIVE_SPIN = 0x40000;
+
+pub extern "c" fn __ulock_wait(op: u32, addr: ?*const c_void, val: u64, timeout_us: u32) c_int;
+pub extern "c" fn __ulock_wake(op: u32, addr: ?*const c_void, val: u64) c_int;
