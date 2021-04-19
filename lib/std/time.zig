@@ -180,7 +180,10 @@ pub const Timer = struct {
             };
         } else if (comptime std.Target.current.isDarwin()) {
             var freq: os.darwin.mach_timebase_info_data = undefined;
-            os.darwin.mach_timebase_info(&freq);
+            switch (os.darwin.mach_timebase_info(&freq)) {
+                os.darwin.KERN_SUCCESS => {},
+                else => return error.TimerUnsupported,
+            }
 
             return Timer{
                 .frequency = freq,
