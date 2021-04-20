@@ -4,6 +4,15 @@
 // The MIT license requires this copyright notice to be included in all copies
 // and substantial portions of the software.
 
+//! A Futex provides a method to block and unblock OS threads by
+//! waiting for either a pointer to change value or another thread to send a notification.
+//!
+//! It works by forming a "wait queue" using the given pointer address and
+//! checking the pointer value atomically when enqueuing to not miss notifications.
+//!
+//! The API is conceptually similar to `std.os.linux.futex_wait` and `std.os.linux.futex_wake`.
+//! See the `wait` and `wake` methods for more information.
+
 const std = @import("../std.zig");
 const target = std.Target.current;
 const Instant = @import("./Instant.zig");
@@ -57,6 +66,8 @@ const WindowsFutex = struct {
     const windows = std.os.windows;
 
     pub fn wait(ptr: *const u32, expected: u32, timeout: ?u64) error{TimedOut}!void {
+        // RtlWaitOnAddress uses a LARGE_INTEGER for timeouts.
+        // The value is in units of 100 nanoseconds, with a negative value being a relative timeout.
         var timeout_val: windows.LARGE_INTEGER = undefined;
         var timeout_ptr: ?*const @TypeOf(timeout_val) = null;
         if (timeout) |timeout_ns| {
@@ -103,10 +114,12 @@ const LinuxFutex = struct {
             @bitCast(i32, expected),
             ts_ptr,
         ))) {
-            0 => {},
-            std.os.EINTR => {},
-            std.os.EAGAIN => {},
+            0 => {}, // notified by `wake()`
+            std.os.EINTR => {}, // spurious wakeup
+            std.os.EAGAIN => {}, // ptr.* != expected
             std.os.ETIMEDOUT => return error.TimedOut,
+            std.os.EINVAL => {}, // possibly invalid timeout
+            std.os.EFAULT => unreachable,
             else => unreachable,
         }
     }
@@ -117,10 +130,9 @@ const LinuxFutex = struct {
             linux.FUTEX_PRIVATE_FLAG | linux.FUTEX_WAKE,
             std.math.cast(i32, waiters) catch std.math.maxInt(i32),
         ))) {
-            0 => {},
-            std.os.EINVAL => {},
-            std.os.EACCES => {},
-            std.os.EFAULT => {},
+            0 => {}, // successful wake up
+            std.os.EINVAL => {}, // invalid futex_wait() on ptr done elsewhere
+            std.os.EFAULT => {}, // pointer became invalid while doing the wake
             else => unreachable,
         }
     }
@@ -130,6 +142,7 @@ const DarwinFutex = struct {
     const darwin = std.os.darwin;
 
     pub fn wait(ptr: *const u32, expected: u32, timeout: ?u64) error{TimedOut}!void {
+        /// __ulock_wait() uses 0 timeout for infinite wait
         var timeout_us: u32 = 0;
         if (timeout) |timeout_ns| {
             timeout_us = std.math.cast(u32, timeout_ns / std.time.ns_per_us) catch std.math.maxInt(u32);
@@ -144,7 +157,7 @@ const DarwinFutex = struct {
 
         if (status >= 0) return;
         switch (-status) {
-            darwin.EINTR => continue,
+            darwin.EINTR => {},
             darwin.EFAULT => unreachable,
             darwin.ETIMEDOUT => return error.TimedOut,
             else => |errno| {
@@ -161,16 +174,25 @@ const DarwinFutex = struct {
         }
 
         while (true) {
-            const status = darwin.__ulock_wake(
-                flags,
-                @ptrCast(*const c_void, ptr),
-                @as(u64, 0),
-            );
+            // Darwin XNU 7195.50.7.100.1 introduced __ulock_wait2 and migrated code paths (notably pthread_cond_t) towards it:
+            // https://github.com/apple/darwin-xnu/commit/d4061fb0260b3ed486147341b72468f836ed6c8f#diff-08f993cc40af475663274687b7c326cc6c3031e0db3ac8de7b24624610616be6
+            //
+            // This XNU version appears to correspond to 11.0.1:
+            // https://kernelshaman.blogspot.com/2021/01/building-xnu-for-macos-big-sur-1101.html
+            const addr = @ptrCast(*const c_void, ptr);
+            const status = blk: {
+                if (target.os.version_range.semver.max >= 11) {
+                    break :blk darwin.__ulock_wait2(flags, addr, 0, 0);
+                } else {
+                    break :blk darwin.__ulock_wait(flags, addr, 0);
+                }
+            };
 
             if (status >= 0) return;
             switch (-status) {
-                darwin.ENOENT => {},
-                darwin.EINTR => continue,
+                darwin.EINTR => continue, // spurious wake()
+                darwin.ENOENT => return, // nothing was woken up
+                darwin.EALREADY => unreachable, // only for ULF_WAKE_THREAD
                 else => |errno| {
                     const _discarded = std.os.unexpectedErrno(@intCast(usize, errno));
                     unreachable;
@@ -181,6 +203,15 @@ const DarwinFutex = struct {
 };
 
 const PosixFutex = struct {
+    //! For posix systems, pthread doesn't provide a futex equivalent so we have to create one in userspace.
+    //! The implementation here is sub-optimal and kept simple as of now to aid in review.
+    //!
+    //! TODO(kprotty):
+    //! - Have a Waiter counter per Bucket which can be checked for > 0 before acquiring the Bucket mutex
+    //! - Implement Rust's parking_lot's WordLock for the Bucket mutex instead of trusting pthread_mutex_t to handle micro-contention. 
+    //! - Try switching from a flat list of Waiters per Bucket to a list of TailQueues for each address per Bucket
+    //! - Convert said list of TailQueues into a self-balancing Tree of TailQueues for each address
+
     pub fn wait(ptr: *const u32, expected: u32, timeout: ?u64) error{TimedOut}!void {
         const bucket = Bucket.from(ptr);
         bucket.lock();
@@ -205,6 +236,8 @@ const PosixFutex = struct {
                 bucket.queue.remove(&waiter);
                 bucket.unlock();
             } else {
+                // A wake() thread already dequeued our Waiter 
+                // and is in the process of setting its Event.
                 bucket.unlock();
                 timed_out = false;
                 waiter.data.event.wait(null) catch unreachable;
@@ -277,6 +310,10 @@ const PosixFutex = struct {
         mutex: std.c.pthread_mutex_t = .{},
 
         fn deinit(self: *Event) void {
+            // On certain systems like Dragonfly BSD,
+            // the destroy functions can return EINVAL
+            // if the pthread type is statically initialized.
+
             const rc = std.c.pthread_cond_destroy(&self.cond);
             std.debug.assert(rc == 0 or rc == std.os.EINVAL);
 
@@ -288,11 +325,16 @@ const PosixFutex = struct {
             std.debug.assert(std.c.pthread_mutex_lock(&self.mutex) == 0);
             defer std.debug.assert(std.c.pthread_mutex_unlock(&self.mutex) == 0);
 
+            // Signal the condition variable while holding the mutex.
+            // Without it, the waiter could wake up and deallocate the Event
+            // after pthread_mutex_unlock() but before pthread_cond_signal().
+
             self.is_set = true;
             std.debug.assert(std.c.pthread_cond_signal(&self.cond) == 0);
         }
 
         fn wait(self: *Event, timeout: ?u64) error{TimedOut}!void {
+            // Begin the starting point for the timeout outside the mutex.
             var started: Instant = undefined;
             if (timeout != null) {
                 started = Instant.now();
@@ -305,13 +347,18 @@ const PosixFutex = struct {
                 const timeout_ns = timeout orelse {
                     std.debug.assert(std.c.pthread_cond_wait(&self.cond, &self.mutex) == 0);
                     continue;
-                }
+                };
 
+                // Check for timeout using Instant as opposed to the result of pthread_cond_timedwait() below.
+                // The latter uses the system time which is more prone to tampering or adjustments.
+                // The former is *effectively* monotonic and should be more consistent. 
                 const elapsed_ns = Instant.now().since(started) orelse 0;
                 if (elapsed_ns >= timeout_ns) {
                     return error.TimedOut;
                 }
 
+                // pthread_cond_timedwait() operates with absolute timeouts based on the system clock.
+                // Get the system clock timestamp using the most appropriate method.
                 const delay_ns = timeout_ns - elapsed_ns;
                 const timestamp_ns = blk: {
                     if (target.isDarwin()) {
@@ -336,8 +383,8 @@ const PosixFutex = struct {
 
                 switch (std.c.pthread_cond_timedwait(&self.cond, &self.mutex, &ts)) {
                     0 => {},
-                    std.os.ETIMEDOUT => {},
-                    std.os.EINVAL => {},
+                    std.os.ETIMEDOUT => {}, // a timeout occured
+                    std.os.EINVAL => {}, // an invalid (out of range?) timespec was provided - it will just busy-loop 
                     std.os.EPERM => unreachable,
                     else => unreachable,
                 }
