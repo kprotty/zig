@@ -8,16 +8,37 @@ const std = @import("../std.zig");
 const target = std.Target.current;
 const Instant = @import("./Instant.zig");
 
+/// Blocks the calling thread while the value at `ptr` is equal to the value of `expected`,
+/// or until it is notified by a matching `wake()`. Spurious wakeups are also allowed.
+///
+/// A `timeout` value in nanoseconds can be provided which acts as a hint for
+/// the maximum amount of time the calling thread can be blocked waiting for the `ptr` to change.
+/// If the timeout delay is reached, the function returns `error.TimedOut`.
+///
+/// The comparison of the `ptr` value to `expected` is done atomically and totally-ordered
+/// with respect to other atomic operations operating on the `ptr` memory location.
 pub fn wait(ptr: *const u32, expected: u32, timeout: ?u64) error{TimedOut}!void {
-    if (timeout != @as(?u64, 0)) return OsFutex.wait(ptr, expected, timeout);
-    return switch (@atomicLoad(u32, ptr, .SeqCst) == expected) {
-        true => error.TimedOut,
-        else => {},
-    };
+    if (std.builtin.single_threaded and timeout == null) {
+        if (@atomicLoad(u32, ptr, .SeqCst) != expected) return;
+        @panic("deadlock detected");
+    }
+
+    if (timeout == @as(?u64, 0)) {
+        if (@atomicLoad(u32, ptr, .SeqCst) != expected) return;
+        return error.TimedOut;
+    }
+
+    return OsFutex.wait(ptr, expected, timeout);
 }
 
+/// Unblocks a set of threads waiting on the `ptr` to be changed by a matching `wait()`.
+/// `waiters` is used as a hint for how many waiting threads to wake up.
+/// Note that blocked threads can still wake up spuriously by timeout or other internal events.
 pub fn wake(ptr: *const u32, waiters: u32) void {
-    if (waiters == 0) return;
+    if (std.builtin.single_threaded or waiters == 0) {
+        return;
+    }
+
     return OsFutex.wake(ptr, waiters);
 }
 
@@ -58,7 +79,6 @@ const WindowsFutex = struct {
     pub fn wake(ptr: *const u32, waiters: u32) void {
         const address = @ptrCast(?*const c_void, ptr);
         switch (waiters) {
-            0 => {},
             1 => RtlWakeAddressSingle(address),
             else => RtlWakeAddressAll(address),
         }
@@ -161,102 +181,167 @@ const DarwinFutex = struct {
 };
 
 const PosixFutex = struct {
-    const Bucket = struct {
-        waiters: u32 = 0,
-        cond: std.c.pthread_cond_t = std.c.PTHREAD_COND_INITIALIZER,
-        mutex: std.c.pthread_mutex_t = std.c.PTHREAD_MUTEX_INITIALIZER,
-
-        var buckets = [_]Bucket{.{}} ** 256;
-
-        fn from(ptr: *const u32) *Bucket {
-            const address = @ptrToInt(ptr) >> @popCount(u3, @alignOf(u32) - 1);
-            const seed = 0x9E3779B97F4A7C15 >> (64 - std.meta.bitCount(usize));
-            const index = (address *% seed) % buckets.len;
-            return &buckets[index];
-        }
-    };
-
     pub fn wait(ptr: *const u32, expected: u32, timeout: ?u64) error{TimedOut}!void {
-        var started: Instant = undefined;
-        if (timeout != null) {
-            started = Instant.now();
+        const bucket = Bucket.from(ptr);
+        bucket.lock();
+
+        if (@atomicLoad(u32, ptr, .SeqCst) != expected) {
+            bucket.unlock();
+            return;
         }
 
-        const bucket = Bucket.from(ptr);
-        std.debug.assert(std.c.pthread_mutex_lock(&bucket.mutex) == 0);
-        defer std.debug.assert(std.c.pthread_mutex_unlock(&bucket.mutex) == 0);
+        var waiter = Waiter{ .data = .{ .ptr = ptr } };
+        bucket.queue.append(&waiter);
+        bucket.unlock();
 
-        @atomicStore(u32, &bucket.waiters, bucket.waiters + 1, .SeqCst);
-        defer @atomicStore(u32, &bucket.waiters, bucket.waiters - 1, .SeqCst);
+        var timed_out = false;
+        waiter.data.event.wait(timeout) {
+            timed_out = true;
+        };
 
-        while (@atomicLoad(u32, ptr, .SeqCst) == expected) {
-            const timeout_ns = timeout orelse {
-                std.debug.assert(std.c.pthread_cond_wait(&bucket.cond, &bucket.mutex) == 0);
-                continue;
-            };
-
-            const elapsed = Instant.now().since(started) orelse 0;
-            if (elapsed >= timeout_ns) {
-                return error.TimedOut;
+        if (timed_out) {
+            bucket.lock();
+            if (waiter.data.enqueued) {
+                bucket.queue.remove(&waiter);
+                bucket.unlock();
+            } else {
+                bucket.unlock();
+                timed_out = false;
+                waiter.data.event.wait(null) catch unreachable;
             }
+        }
 
-            const delay = timeout_ns - elapsed;
-            const timestamp = blk: {
-                if (target.isDarwin()) {
-                    var tv: std.os.timeval = undefined;
-                    std.os.gettimeofday(&tv, null);
-                    const secs = @intCast(u64, tv.tv_sec) * std.time.ns_per_s;
-                    const nsecs = @intCast(u64, tv.tv_usec) * std.time.ns_per_us;
-                    break :blk (secs + nsecs);
-                }
-
-                var ts: std.os.timespec = undefined;
-                std.os.clock_gettime(std.os.CLOCK_REALTIME, &ts) catch {
-                    ts.tv_sec = std.math.maxInt(@TypeOf(ts.tv_sec)) / std.time.ns_per_s;
-                    ts.tv_nsec = std.time.ns_per_s - 1;
-                };
-
-                const secs = @intCast(u64, ts.tv_sec) * std.time.ns_per_s;
-                const nsecs = @intCast(u64, ts.tv_nsec);
-                break :blk (secs + nsecs);
-            };
-
-            var expires: u64 = undefined;
-            if (@addWithOverflow(u64, expires, delay, &expires)) {
-                expires = std.math.maxInt(u64);
-            }
-
-            var ts: std.os.timespec = undefined;
-            ts.tv_sec = @intCast(@TypeOf(ts.tv_sec), expires / std.time.ns_per_s);
-            ts.tv_nsec = @intCast(@TypeOf(ts.tv_nsec), expires % std.time.ns_per_s);
-
-            switch (std.c.pthread_cond_timedwait(&bucket.cond, &bucket.mutex, &ts)) {
-                0 => {},
-                std.os.ETIMEDOUT => {},
-                else => unreachable,
-            }
+        waiter.data.event.deinit();
+        if (timed_out) {
+            return error.TimedOut;
         }
     }
 
     pub fn wake(ptr: *const u32, waiters: u32) void {
+        var notified = WaitQueue{};
         const bucket = Bucket.from(ptr);
-        if (@atomicLoad(u32, &bucket.waiters, .SeqCst) == 0) {
-            return;
-        }
+        bucket.lock();
 
-        {
-            std.debug.assert(std.c.pthread_mutex_lock(&bucket.mutex) == 0);
-            defer std.debug.assert(std.c.pthread_mutex_unlock(&bucket.mutex) == 0);
+        var idle_waiter = bucket.queue.first;
+        while (idle_waiter) |waiter| {
+            idle_waiter = waiter.next;
+            if (waiter.data.ptr != ptr) {
+                continue;
+            }
 
-            if (@atomicLoad(u32, &bucket.waiters, .SeqCst) == 0) {
-                return;
+            waiter.data.enqueued = false;
+            bucket.queue.remove(waiter);
+            notified.append(waiter);
+
+            std.debug.assert(waiters > 0);
+            if (notified.len >= waiters) {
+                break;
             }
         }
 
-        switch (waiters) {
-            0 => unreachable,
-            1 => std.debug.assert(std.c.pthread_cond_signal(&bucket.cond) == 0),
-            else => std.debug.assert(std.c.pthread_cond_broadcast(&bucket.cond) == 0),
+        bucket.unlock();
+        while (notified.popFirst()) |waiter| {
+            waiter.data.event.set();
         }
     }
+
+    const Waiter = WaitQueue.Node;
+    const WaitQueue = std.TailQueue(struct {
+        ptr: *const u32,
+        event: Event = .{},
+        enqueued: bool = true,
+    });
+
+    const Bucket = struct {
+        queue: WaitQueue = .{},
+        mutex: std.c.pthread_mutex_t = .{},
+
+        var table = [_]Bucket{.{}} ** 256;
+
+        fn from(ptr: *const u32) callconv(.Inline) *Bucket {
+            return &table[@ptrToInt(ptr) % table.len];
+        }
+
+        fn lock(self: *Bucket) callconv(.Inline) void {
+            std.debug.assert(std.c.pthread_mutex_lock(&self.mutex) == 0);
+        }
+
+        fn unlock(self: *Bucket) callconv(.Inline) void {
+            std.debug.assert(std.c.pthread_mutex_unlock(&self.mutex) == 0);
+        }
+    };
+
+    const Event = struct {
+        is_set: bool = false,
+        cond: std.c.pthread_cond_t = .{},
+        mutex: std.c.pthread_mutex_t = .{},
+
+        fn deinit(self: *Event) void {
+            const rc = std.c.pthread_cond_destroy(&self.cond);
+            std.debug.assert(rc == 0 or rc == std.os.EINVAL);
+
+            const rm = std.c.pthread_mutex_destroy(&self.mutex);
+            std.debug.assert(rm == 0 or rm == std.os.EINVAL);
+        }
+
+        fn set(self: *Event) void {
+            std.debug.assert(std.c.pthread_mutex_lock(&self.mutex) == 0);
+            defer std.debug.assert(std.c.pthread_mutex_unlock(&self.mutex) == 0);
+
+            self.is_set = true;
+            std.debug.assert(std.c.pthread_cond_signal(&self.cond) == 0);
+        }
+
+        fn wait(self: *Event, timeout: ?u64) error{TimedOut}!void {
+            var started: Instant = undefined;
+            if (timeout != null) {
+                started = Instant.now();
+            }
+
+            std.debug.assert(std.c.pthread_mutex_lock(&self.mutex) == 0);
+            defer std.debug.assert(std.c.pthread_mutex_unlock(&self.mutex) == 0);
+
+            while (!self.is_set) {
+                const timeout_ns = timeout orelse {
+                    std.debug.assert(std.c.pthread_cond_wait(&self.cond, &self.mutex) == 0);
+                    continue;
+                }
+
+                const elapsed_ns = Instant.now().since(started) orelse 0;
+                if (elapsed_ns >= timeout_ns) {
+                    return error.TimedOut;
+                }
+
+                const delay_ns = timeout_ns - elapsed_ns;
+                const timestamp_ns = blk: {
+                    if (target.isDarwin()) {
+                        var tv: std.os.timeval = undefined;
+                        std.os.gettimeofday(&tv);
+                        break :blk (@intCast(u64, tv.tv_sec) * std.time.ns_per_s) + (@intCast(u64, tv.tv_usec) * std.time.ns_per_us);
+                    } else {
+                        var ts: std.os.timespec = undefined;
+                        std.os.clock_gettime(std.os.CLOCK_REALTIME, &ts) catch break :blk std.math.maxInt(u64);
+                        break :blk (@intCast(u64, ts.tv_sec) * std.time.ns_per_s) + @intCast(u64, ts.tv_nsec);
+                    }
+                };
+
+                var deadline_ns: u64 = undefined;
+                if (@addWithOverflow(u64, timestamp_ns, delay_ns, &deadline_ns)) {
+                    deadline_ns = std.math.maxInt(u64);
+                }
+
+                var ts: std.os.timespec = undefined;
+                ts.tv_sec = std.math.cast(@TypeOf(ts.tv_sec), deadline_ns / std.time.ns_per_s) catch std.math.maxInt(@TypeOf(ts.tv_sec));
+                ts.tv_nsec = @intCast(@TypeOf(ts.tv_nsec), deadline_ns % std.time.ns_per_s);
+
+                switch (std.c.pthread_cond_timedwait(&self.cond, &self.mutex, &ts)) {
+                    0 => {},
+                    std.os.ETIMEDOUT => {},
+                    std.os.EINVAL => {},
+                    std.os.EPERM => unreachable,
+                    else => unreachable,
+                }
+            }
+        }
+    };
 };
