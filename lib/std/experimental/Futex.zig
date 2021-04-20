@@ -142,7 +142,7 @@ const DarwinFutex = struct {
     const darwin = std.os.darwin;
 
     pub fn wait(ptr: *const u32, expected: u32, timeout: ?u64) error{TimedOut}!void {
-        /// __ulock_wait() uses 0 timeout for infinite wait
+        // __ulock_wait() uses 0 timeout for infinite wait
         var timeout_us: u32 = 0;
         if (timeout) |timeout_ns| {
             timeout_us = std.math.cast(u32, timeout_ns / std.time.ns_per_us) catch std.math.maxInt(u32);
@@ -212,104 +212,239 @@ const PosixFutex = struct {
     //! - Try switching from a flat list of Waiters per Bucket to a list of TailQueues for each address per Bucket
     //! - Convert said list of TailQueues into a self-balancing Tree of TailQueues for each address
 
-    pub fn wait(ptr: *const u32, expected: u32, timeout: ?u64) error{TimedOut}!void {
-        const bucket = Bucket.from(ptr);
-        bucket.lock();
+    // pub fn wait(ptr: *const u32, expected: u32, timeout: ?u64) error{TimedOut}!void {
+    //     const address = Bucket.addressOf(ptr);
+    //     const bucket = Bucket.from(address);
+    //     bucket.lock();
 
-        if (@atomicLoad(u32, ptr, .SeqCst) != expected) {
-            bucket.unlock();
-            return;
-        }
+    //     if (@atomicLoad(u32, ptr, .SeqCst) != expected) {
+    //         bucket.unlock();
+    //         return;
+    //     }
 
-        var waiter = Waiter{ .data = .{ .ptr = ptr } };
-        bucket.queue.append(&waiter);
-        bucket.unlock();
+    //     var waiter = Waiter{ .data = .{ .address = address } };
+    //     waiter.list.first =
 
-        var timed_out = false;
-        waiter.data.event.wait(timeout) {
-            timed_out = true;
-        };
+    //     bucket.queue.append(&waiter);
+    //     bucket.unlock();
 
-        if (timed_out) {
-            bucket.lock();
-            if (waiter.data.enqueued) {
-                bucket.queue.remove(&waiter);
-                bucket.unlock();
-            } else {
-                // A wake() thread already dequeued our Waiter 
-                // and is in the process of setting its Event.
-                bucket.unlock();
-                timed_out = false;
-                waiter.data.event.wait(null) catch unreachable;
-            }
-        }
+    //     var timed_out = false;
+    //     waiter.data.event.wait(timeout) {
+    //         timed_out = true;
+    //     };
 
-        waiter.data.event.deinit();
-        if (timed_out) {
-            return error.TimedOut;
-        }
-    }
+    //     if (timed_out) {
+    //         bucket.lock();
+    //         if (waiter.data.enqueued) {
+    //             bucket.queue.remove(&waiter);
+    //             bucket.unlock();
+    //         } else {
+    //             // A wake() thread already dequeued our Waiter
+    //             // and is in the process of setting its Event.
+    //             bucket.unlock();
+    //             timed_out = false;
+    //             waiter.data.event.wait(null) catch unreachable;
+    //         }
+    //     }
 
-    pub fn wake(ptr: *const u32, waiters: u32) void {
-        var notified = WaitQueue{};
-        const bucket = Bucket.from(ptr);
-        bucket.lock();
+    //     waiter.data.event.deinit();
+    //     if (timed_out) {
+    //         return error.TimedOut;
+    //     }
+    // }
 
-        var idle_waiter = bucket.queue.first;
-        while (idle_waiter) |waiter| {
-            idle_waiter = waiter.next;
-            if (waiter.data.ptr != ptr) {
-                continue;
-            }
+    // pub fn wake(ptr: *const u32, waiters: u32) void {
+    //     var notified = WaitQueue{};
+    //     const bucket = Bucket.from(ptr);
+    //     bucket.lock();
 
-            waiter.data.enqueued = false;
-            bucket.queue.remove(waiter);
-            notified.append(waiter);
+    //     var idle_waiter = bucket.queue.first;
+    //     while (idle_waiter) |waiter| {
+    //         idle_waiter = waiter.next;
+    //         if (waiter.data.ptr != ptr) {
+    //             continue;
+    //         }
 
-            std.debug.assert(waiters > 0);
-            if (notified.len >= waiters) {
-                break;
-            }
-        }
+    //         waiter.data.enqueued = false;
+    //         bucket.queue.remove(waiter);
+    //         notified.append(waiter);
 
-        bucket.unlock();
-        while (notified.popFirst()) |waiter| {
-            waiter.data.event.set();
-        }
-    }
+    //         std.debug.assert(waiters > 0);
+    //         if (notified.len >= waiters) {
+    //             break;
+    //         }
+    //     }
 
-    const Waiter = WaitQueue.Node;
-    const WaitQueue = std.TailQueue(struct {
-        ptr: *const u32,
-        event: Event = .{},
-        enqueued: bool = true,
-    });
+    //     bucket.unlock();
+    //     while (notified.popFirst()) |waiter| {
+    //         waiter.data.event.set();
+    //     }
+    // }
 
-    const Bucket = struct {
-        queue: WaitQueue = .{},
+    const WaitBucket = struct {
+        waiters: usize = 0,
+        tree: WaitTree = .{},
         mutex: std.c.pthread_mutex_t = .{},
 
-        var table = [_]Bucket{.{}} ** 256;
+        var table = [_]WaitBucket{.{}} ** 256;
 
-        fn from(ptr: *const u32) callconv(.Inline) *Bucket {
-            return &table[@ptrToInt(ptr) % table.len];
+        /// Convert the pointer to an integer and chop of its aligned bits that are zero.
+        fn addressOf(ptr: *const u32) callconv(.Inline) usize {
+            return @ptrToInt(ptr) >> 2;
         }
 
-        fn lock(self: *Bucket) callconv(.Inline) void {
+        /// Hash the address to a WaitBucket using the Fibonacci Hashing:
+        /// https://probablydance.com/2018/06/16/fibonacci-hashing-the-optimization-that-the-world-forgot-or-a-better-alternative-to-integer-modulo/
+        fn from(address: usize) callconv(.Inline) *WaitBucket {
+            const seed = 0x9E3779B97F4A7C15 >> (64 - std.meta.bitCount(usize));
+            const index = (address *% seed) % table.len;
+            return &table[index];
+        }
+
+        /// Acquire ownership over the WaitBucket's WaitTree
+        fn lock(self: *WaitBucket) callconv(.Inline) void {
             std.debug.assert(std.c.pthread_mutex_lock(&self.mutex) == 0);
         }
 
-        fn unlock(self: *Bucket) callconv(.Inline) void {
+        /// Release ownership over the WaitBucket's WaitTree
+        fn unlock(self: *WaitBucket) callconv(.Inline) void {
             std.debug.assert(std.c.pthread_mutex_unlock(&self.mutex) == 0);
         }
     };
 
-    const Event = struct {
+    const Waiter = struct {
+        address: usize,
+        list_prev: ?*Waiter = undefined,
+        list_next: ?*Waiter = undefined,
+        prev: ?*Waiter = undefined,
+        next: ?*Waiter = undefined,
+        tail: *Waiter = undefined,
+        is_enqueued: bool = false,
+        event: Event = .{},
+    };
+
+    const Tree = struct {
+        list_root: ?*Waiter = null,
+
+        fn find(self: *Tree, address: usize) Queue {
+            var queue = Queue{
+                .tree = self,
+                .address = address,
+                .head = self.list_root,
+            };
+
+            while (true) {
+                const head = queue.head orelse return queue;
+                if (head.addres == address) return queue;
+                queue.list_prev = head;
+                queue.head = head.list_next;
+            }
+        }
+
+        fn replace(self: *Tree, old: *Waiter, new: ?*Waiter) void {
+            const root = self.list_root orelse unreachable;
+            if (new) |new_waiter| {
+                new_waiter.list_prev = old.list_prev;
+                new_waiter.list_next = old.list_next;
+            }
+
+            if (old.list_prev) |list_prev| {
+                list_prev.list_next = new orelse old.list_next;
+            }
+            if (old.list_next) |list_next| {
+                list_next.list_prev = new orelse old.list_prev;
+            }
+            if (old == self.list_root) {
+                self.list_root = new orelse old.list_next;
+            }
+        }
+    };
+
+    const Queue = struct {
+        tree: *Tree,
+        address: usize,
+        head: ?*Waiter,
+        list_prev: ?*Waiter = null,
+
+        fn find(tree: *Tree, waiter: *Waiter) Queue {
+            std.debug.assert(waiter.is_enqueued);
+
+            const address = waiter.address;
+            if (waiter.prev != null) {
+                return tree.lookup(address);
+            }
+
+            return Queue{
+                .tree = tree,
+                .address = address,
+                .head = waiter,
+                .list_prev = waiter.list_prev,
+            };
+        }
+
+        fn push(self: *Queue, waiter: *Waiter) void {
+            waiter.address = self.address;
+            waiter.is_enqueued = true;
+            waiter.next = null;
+
+            if (self.head) |head| {
+                head.tail.next = waiter;
+                waiter.prev = head.tail;
+                head.tail = waiter;
+                return;
+            }
+
+            waiter.list_prev = self.list_prev;
+            waiter.list_next = null;
+            waiter.prev = null;
+            waiter.tail = waiter;
+            self.head = waiter;
+
+            if (self.list_prev) |list_prev| {
+                list_prev.list_next = waiter;
+            } else {
+                self.tree.root = waiter;
+            }
+        }
+
+        fn pop(self: *Queue) ?*Waiter {
+            const waiter = self.head orelse return null;
+            self.remove(waiter);
+            return waiter;
+        }
+
+        fn remove(self: *Queue, waiter: *Waiter) void {
+            const head = self.head orelse unreachable;
+            std.debug.assert(waiter.is_enqueued);
+            waiter.is_enqueued = false;
+
+            if (waiter.prev) |prev| {
+                prev.next = waiter.next;
+                if (waiter.next) |next| {
+                    next.prev = prev;
+                } else {
+                    head.tail = prev;
+                }
+                return;
+            }
+
+            std.debug.assert(waiter == head);
+            self.tree.replace(waiter, waiter.next);
+            self.head = waiter.next;
+            if (self.head) |new_head| {
+                new_head.tail = head.tail;
+            }
+        }
+    };
+
+    
+
+    const WaitEvent = struct {
         is_set: bool = false,
         cond: std.c.pthread_cond_t = .{},
         mutex: std.c.pthread_mutex_t = .{},
 
-        fn deinit(self: *Event) void {
+        fn deinit(self: *WaitEvent) void {
             // On certain systems like Dragonfly BSD,
             // the destroy functions can return EINVAL
             // if the pthread type is statically initialized.
@@ -321,7 +456,7 @@ const PosixFutex = struct {
             std.debug.assert(rm == 0 or rm == std.os.EINVAL);
         }
 
-        fn set(self: *Event) void {
+        fn set(self: *WaitEvent) void {
             std.debug.assert(std.c.pthread_mutex_lock(&self.mutex) == 0);
             defer std.debug.assert(std.c.pthread_mutex_unlock(&self.mutex) == 0);
 
@@ -333,7 +468,7 @@ const PosixFutex = struct {
             std.debug.assert(std.c.pthread_cond_signal(&self.cond) == 0);
         }
 
-        fn wait(self: *Event, timeout: ?u64) error{TimedOut}!void {
+        fn wait(self: *WaitEvent, timeout: ?u64) error{TimedOut}!void {
             // Begin the starting point for the timeout outside the mutex.
             var started: Instant = undefined;
             if (timeout != null) {
@@ -351,7 +486,7 @@ const PosixFutex = struct {
 
                 // Check for timeout using Instant as opposed to the result of pthread_cond_timedwait() below.
                 // The latter uses the system time which is more prone to tampering or adjustments.
-                // The former is *effectively* monotonic and should be more consistent. 
+                // The former is *effectively* monotonic and should be more consistent.
                 const elapsed_ns = Instant.now().since(started) orelse 0;
                 if (elapsed_ns >= timeout_ns) {
                     return error.TimedOut;
@@ -384,7 +519,7 @@ const PosixFutex = struct {
                 switch (std.c.pthread_cond_timedwait(&self.cond, &self.mutex, &ts)) {
                     0 => {},
                     std.os.ETIMEDOUT => {}, // a timeout occured
-                    std.os.EINVAL => {}, // an invalid (out of range?) timespec was provided - it will just busy-loop 
+                    std.os.EINVAL => {}, // an invalid (out of range?) timespec was provided - it will just busy-loop
                     std.os.EPERM => unreachable,
                     else => unreachable,
                 }
