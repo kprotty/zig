@@ -126,6 +126,7 @@ test {
         _ = testing;
         _ = time;
         _ = unicode;
+        _ = x;
         _ = zig;
         _ = start;
     } else {

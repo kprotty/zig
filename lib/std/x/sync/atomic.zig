@@ -6,6 +6,7 @@
 
 const std = @import("../../std.zig");
 const target = std.Target.current;
+const testing = std.testing;
 
 const AtomicOrder = std.builtin.AtomicOrder;
 const AtomicRmwOp = std.builtin.AtomicRmwOp;
@@ -106,7 +107,7 @@ test "load" {
 pub fn store(ptr: anytype, value: @TypeOf(ptr.*), comptime ordering: Ordering) void {
     switch (ordering) {
         .Unordered, .Relaxed, .Release, .SeqCst => {
-            return @atomicLoad(@TypeOf(ptr.*), ptr, comptime ordering.toBuiltin());
+            @atomicStore(@TypeOf(ptr.*), ptr, value, comptime ordering.toBuiltin());
         },
         .AcqRel => {
             @compileLog(ordering, " implies ", Ordering.Acquire, " which only applies to atomic loads");
@@ -141,7 +142,7 @@ test "swap" {
 
         var y: enum(usize) { a, b, c } = .c;
         testing.expectEqual(swap(&y, .a, ordering), .c);
-        testing.expectEqual(load(&y, .SeqCst), .c);
+        testing.expectEqual(load(&y, .SeqCst), .a);
 
         var z: f32 = 5.0;
         testing.expectEqual(swap(&z, 10.0, ordering), 5.0);
@@ -149,7 +150,7 @@ test "swap" {
 
         var a: bool = false;
         testing.expectEqual(swap(&a, true, ordering), false);
-        testing.expectEqual(load(&a, .SeqCst), false);
+        testing.expectEqual(load(&a, .SeqCst), true);
 
         var b: ?*u8 = null;
         testing.expectEqual(swap(&b, @intToPtr(?*u8, @alignOf(u8)), ordering), null);
@@ -279,11 +280,11 @@ fn atomicRmw(
                 .Bool => @sizeOf(bool) * 8,
                 .Int => |info| blk: {
                     if (info.bits % 8 != 0) break :blk null;
-                    break blk: info.bits,
+                    break :blk info.bits;
                 },
                 .Float => |info| blk: {
                     if (info.bits % 8 != 0) break :blk null;
-                    break blk: info.bits,
+                    break :blk info.bits;
                 },
                 .Enum => |info| bitCountOf(info.tag_type),
                 .Optional => |info| switch (@typeInfo(info.child)) {
@@ -366,22 +367,33 @@ fn cmpxchg(
         .AcqRel => {
             @compileLog("Failure ordering ", failure, " implies ", Ordering.Release, " which only applies to atomic stores, not the atomic load on failed comparison");
         },
-        .Acquire => {},
+        .Acquire, .Consume => {},
         .Release => {
             @compileLog("Failure ordering ", failure, " only applies to atomic stores, not the atomic load on failed comparison");
         },
         .Relaxed => {},
-        .Consume, .Unordered => {
+        .Unordered => {
             @compileLog("Failure ordering ", failure, " only applies to atomic loads or stores, not read-modify-write operations");
         },
     }
 
     const is_stronger = switch (success) {
         .SeqCst => true,
-        .AcqRel, .Acquire, .Release => failure == .Acquire or failure == .Relaxed,
-        .Relaxed => failure == .Relaxed,
-        .Consume, .Unordered => {
+        .AcqRel, .Acquire, .Release => switch (failure) {
+            .Acquire, .Consume, .Relaxed => true,
+            else => false,
+        },
+        .Consume => switch (failure) {
+            .Consume, .Relaxed => true,
+            else => false,
+        },
+        .Relaxed => switch (failure) {
+            .Relaxed => true,
+            else => false,
+        },
+        .Unordered => blk: {
             @compileLog("Success ordering ", success, " only applies to atomic loads or stores, not read-modify-write operations");
+            break :blk false;
         },
     };
 
@@ -447,7 +459,7 @@ test "tryCompareAndSwap" {
 
 pub fn bitGet(
     ptr: anytype, 
-    bit: std.meta.Log2Int(@TypeOf(ptr.*)), 
+    bit: std.math.Log2Int(@TypeOf(ptr.*)), 
     comptime ordering: Ordering,
 ) u1 {
     return atomicBit(@TypeOf(ptr.*), ptr, .Get, bit, ordering);
@@ -465,7 +477,7 @@ test "bitGet" {
 
 pub fn bitSet(
     ptr: anytype, 
-    bit: std.meta.Log2Int(@TypeOf(ptr.*)), 
+    bit: std.math.Log2Int(@TypeOf(ptr.*)), 
     comptime ordering: Ordering,
 ) u1 {
     return atomicBit(@TypeOf(ptr.*), ptr, .Set, bit, ordering);
@@ -477,7 +489,7 @@ test "bitSet" {
         const bit_array = @as([std.meta.bitCount(usize)]void, undefined);
 
         for (bit_array) |_, bit_index| {
-            const bit = @intCast(std.meta.Log2Int(usize), bit_index);
+            const bit = @intCast(std.math.Log2Int(usize), bit_index);
             const mask = @as(usize, 1) << bit;
 
             // setting the bit should change the bit
@@ -491,7 +503,7 @@ test "bitSet" {
 
             // all the previous bits should have not changed (still be set)
             for (bit_array[0..bit_index]) |_, prev_bit_index| {
-                const prev_bit = @intCast(std.meta.Log2Int(usize), prev_bit_index);
+                const prev_bit = @intCast(std.math.Log2Int(usize), prev_bit_index);
                 const prev_mask = @as(usize, 1) << prev_bit;
                 testing.expect(load(&x, .SeqCst) & prev_mask != 0);
             }
@@ -501,7 +513,7 @@ test "bitSet" {
 
 pub fn bitReset(
     ptr: anytype, 
-    bit: std.meta.Log2Int(@TypeOf(ptr.*)), 
+    bit: std.math.Log2Int(@TypeOf(ptr.*)), 
     comptime ordering: Ordering,
 ) u1 {
     return atomicBit(@TypeOf(ptr.*), ptr, .Reset, bit, ordering);
@@ -513,7 +525,7 @@ test "bitReset" {
         const bit_array = @as([std.meta.bitCount(usize)]void, undefined);
 
         for (bit_array) |_, bit_index| {
-            const bit = @intCast(std.meta.Log2Int(usize), bit_index);
+            const bit = @intCast(std.math.Log2Int(usize), bit_index);
             const mask = @as(usize, 1) << bit;
             x |= mask;
 
@@ -528,7 +540,7 @@ test "bitReset" {
 
             // all the previous bits should have not changed (still be reset)
             for (bit_array[0..bit_index]) |_, prev_bit_index| {
-                const prev_bit = @intCast(std.meta.Log2Int(usize), prev_bit_index);
+                const prev_bit = @intCast(std.math.Log2Int(usize), prev_bit_index);
                 const prev_mask = @as(usize, 1) << prev_bit;
                 testing.expect(load(&x, .SeqCst) & prev_mask == 0);
             }
@@ -538,7 +550,7 @@ test "bitReset" {
 
 pub fn bitToggle(
     ptr: anytype, 
-    bit: std.meta.Log2Int(@TypeOf(ptr.*)), 
+    bit: std.math.Log2Int(@TypeOf(ptr.*)), 
     comptime ordering: Ordering,
 ) u1 {
     return atomicBit(@TypeOf(ptr.*), ptr, .Toggle, bit, ordering);
@@ -550,7 +562,7 @@ test "bitToggle" {
         const bit_array = @as([std.meta.bitCount(usize)]void, undefined);
 
         for (bit_array) |_, bit_index| {
-            const bit = @intCast(std.meta.Log2Int(usize), bit_index);
+            const bit = @intCast(std.math.Log2Int(usize), bit_index);
             const mask = @as(usize, 1) << bit;
 
             // toggling the bit should change the bit
@@ -564,7 +576,7 @@ test "bitToggle" {
 
             // all the previous bits should have not changed (still be toggled back)
             for (bit_array[0..bit_index]) |_, prev_bit_index| {
-                const prev_bit = @intCast(std.meta.Log2Int(usize), prev_bit_index);
+                const prev_bit = @intCast(std.math.Log2Int(usize), prev_bit_index);
                 const prev_mask = @as(usize, 1) << prev_bit;
                 testing.expect(load(&x, .SeqCst) & prev_mask == 0);
             }
@@ -576,7 +588,7 @@ fn atomicBit(
     comptime T: type, 
     ptr: *T, 
     comptime op: AtomicBitOp, 
-    bit: std.meta.Log2Int(T), 
+    bit: std.math.Log2Int(T), 
     comptime ordering: Ordering,
 ) u1 {
     const mask = @as(T, 1) << bit;
@@ -628,7 +640,7 @@ fn atomicBit(
                 .Reset => fetchAnd(ptr, ~mask, ordering),
                 .Toggle => fetchXor(ptr, mask, ordering),
             };
-        };
+        }
 
         const success = ordering;
         const failure = switch (ordering) {

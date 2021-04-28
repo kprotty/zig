@@ -145,7 +145,7 @@ const DarwinFutex = struct {
     const darwin = std.os.darwin;
 
     pub fn wait(ptr: *const u32, expected: u32, timeout: ?u64) error{TimedOut}!void {
-        /// __ulock_wait() uses 0 timeout for infinite wait
+        // __ulock_wait() uses 0 timeout for infinite wait
         var timeout_us: u32 = 0;
         if (timeout) |timeout_ns| {
             timeout_us = std.math.cast(u32, timeout_ns / std.time.ns_per_us) catch std.math.maxInt(u32);
@@ -512,7 +512,7 @@ pub fn UserspaceImpl(comptime SyncImpl: type) type {
             defer while (woke_up) |node| {
                 woke_up = node.next;
                 node.event.set();
-            }
+            };
 
             bucket.lock.acquire();
             defer bucket.lock.release();
