@@ -22,7 +22,7 @@ pub const sync = struct {
 };
 
 test "" {
-    inline for (.{ time, sync }) |modules| {
+    inline for (.{ os, time, sync }) |modules| {
         _ = std.testing.refAllDecls(modules);
     }
 }

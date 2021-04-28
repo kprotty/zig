@@ -253,84 +253,11 @@ fn atomicRmw(
 ) callconv(.Inline) T {
     @setRuntimeSafety(false);
 
-    switch (ordering) {
-        .SeqCst, .AcqRel, .Acquire, .Release, .Consume, .Relaxed => {},
-        .Unordered => {
-            @compileLog(ordering, " only applies to atomic loads or stores, not read-modify-write operations");
-        },
+    if (ordering == .Unordered) {
+        @compileLog(ordering, " only applies to atomic loads or stores, not read-modify-write operations");
     }
     
-    // TODO: https://github.com/ziglang/zig/issues/8597
-    switch (target.cpu.arch) {
-        .arm, .armeb, .thumb, .thumbeb, .aarch64, .aarch64_be, .aarch64_32 => {},
-        else => {
-            return @atomicRmw(T, ptr, op, value, comptime ordering.toBuiltin());
-        },
-    }
-
-    const AtomicRmwHelper = struct {
-        fn unsafeCast(comptime U: type, current: anytype) U {
-            var fill: U = undefined;
-            @memcpy(@ptrCast([*]u8, &fill), @ptrCast([*]const u8, &current), @sizeOf(U));
-            return fill;
-        }
-
-        fn bitCountOf(comptime U: type) ?u16 {
-            return switch (@typeInfo(U)) {
-                .Bool => @sizeOf(bool) * 8,
-                .Int => |info| blk: {
-                    if (info.bits % 8 != 0) break :blk null;
-                    break :blk info.bits;
-                },
-                .Float => |info| blk: {
-                    if (info.bits % 8 != 0) break :blk null;
-                    break :blk info.bits;
-                },
-                .Enum => |info| bitCountOf(info.tag_type),
-                .Optional => |info| switch (@typeInfo(info.child)) {
-                    .Pointer => bitCountOf(info.child),
-                    else => null,
-                },
-                .Pointer => |info| blk: {
-                    if (info.is_const or info.is_volatile) break :blk null;
-                    if (info.size == .Slice) break :blk null;
-                    break :blk bitCountOf(usize);
-                },
-                else => null,
-            };
-        }
-    };
-
-    const bit_count = AtomicRmwHelper.bitCountOf(T) orelse {
-        @compileError(@typeName(T) ++ " does not support atomic operations");
-    };
-
-    const Int = std.meta.Int(.unsigned, bit_count);
-    const int_ptr = @intToPtr(*Int, @ptrToInt(ptr));
-
-    var old_int = @atomicLoad(Int, int_ptr, .Monotonic);
-    while (true) {
-        const old_value = AtomicRmwHelper.unsafeCast(T, old_int);
-        const new_value = switch (op) {
-            .Xchg => value,
-            .Add => old_value + value,
-            .Sub => old_value - value,
-            .And => old_value & value,
-            .Or => old_value | value,
-            .Xor => old_value ^ value,
-            else => @compileLog(op, " unimplemented"),
-        };
-
-        const new_int = AtomicRmwHelper.unsafeCast(Int, new);
-        old_int = @cmpxchgWeak(
-            Int, 
-            int_ptr, 
-            old_int, 
-            new_int, 
-            ordering, 
-            .Monotonic,
-        ) orelse return old_value; 
-    }
+    return @atomicRmw(T, ptr, op, value, comptime ordering.toBuiltin());
 }
 
 pub fn compareAndSwap(
@@ -643,7 +570,7 @@ fn atomicBit(
         }
 
         const success = ordering;
-        const failure = switch (ordering) {
+        const failure: Ordering = switch (ordering) {
             .SeqCst => .SeqCst,
             .AcqRel, .Acquire, .Consume => .Acquire,
             .Release, .Relaxed => .Relaxed,
@@ -652,13 +579,13 @@ fn atomicBit(
             },
         };
 
-        var old = @atomicLoad(T, ptr, failure);
+        var old = @atomicLoad(T, ptr, comptime failure.toBuiltin());
         while (true) {
             const new = switch (op) {
                 .Get => unreachable,
-                .Set => value | mask,
-                .Reset => value & ~mask,
-                .Toggle => value ^ mask,
+                .Set => old | mask,
+                .Reset => old & ~mask,
+                .Toggle => old ^ mask,
             };
             
             if (old == new) break :blk old;
