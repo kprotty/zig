@@ -12,6 +12,7 @@ const math = std.math;
 const is_windows = std.Target.current.os.tag == .windows;
 
 pub const epoch = @import("time/epoch.zig");
+pub const Instant = @import("time/Instant.zig");
 
 /// Spurious wakeups are possible and no precision of timing is guaranteed.
 pub fn sleep(nanoseconds: u64) void {
@@ -180,7 +181,10 @@ pub const Timer = struct {
             };
         } else if (comptime std.Target.current.isDarwin()) {
             var freq: os.darwin.mach_timebase_info_data = undefined;
-            os.darwin.mach_timebase_info(&freq);
+            switch (os.darwin.mach_timebase_info(&freq)) {
+                os.darwin.KERN_SUCCESS => {},
+                else => return error.TimerUnsupported,
+            }
 
             return Timer{
                 .frequency = freq,

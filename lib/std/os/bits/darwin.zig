@@ -234,7 +234,10 @@ pub const mach_timespec_t = extern struct {
     tv_sec: c_uint,
     tv_nsec: clock_res_t,
 };
+
 pub const kern_return_t = c_int;
+pub const KERN_SUCCESS = 0;
+
 pub const host_t = mach_port_t;
 pub const CALENDAR_CLOCK = 1;
 

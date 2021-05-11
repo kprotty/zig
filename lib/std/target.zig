@@ -69,6 +69,13 @@ pub const Target = struct {
                 };
             }
 
+            pub fn isBSD(tag: Tag) bool {
+                return tag.isDarwin() or switch (tag) {
+                    .freebsd, .kfreebsd, .openbsd, .netbsd, .dragonfly => true,
+                    else => false,
+                };
+            }
+
             pub fn dynamicLibSuffix(tag: Tag) [:0]const u8 {
                 if (tag.isDarwin()) {
                     return ".dylib";
@@ -767,6 +774,13 @@ pub const Target = struct {
             spirv32,
             spirv64,
 
+            pub fn isX86(arch: Arch) bool {
+                return switch (arch) {
+                    .i386, .x86_64 => true,
+                    else => false,
+                };
+            }
+
             pub fn isARM(arch: Arch) bool {
                 return switch (arch) {
                     .arm, .armeb => true,
@@ -1343,10 +1357,7 @@ pub const Target = struct {
     }
 
     pub fn isAndroid(self: Target) bool {
-        return switch (self.abi) {
-            .android => true,
-            else => false,
-        };
+        return self.abi == .android;
     }
 
     pub fn isWasm(self: Target) bool {
@@ -1355,6 +1366,10 @@ pub const Target = struct {
 
     pub fn isDarwin(self: Target) bool {
         return self.os.tag.isDarwin();
+    }
+
+    pub fn isBSD(self: Target) bool {
+        return self.os.tag.isBSD();
     }
 
     pub fn isGnuLibC_os_tag_abi(os_tag: Os.Tag, abi: Abi) bool {
