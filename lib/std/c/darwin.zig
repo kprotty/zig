@@ -247,3 +247,15 @@ pub const ULF_WAIT_ADAPTIVE_SPIN = 0x40000;
 pub extern "c" fn __ulock_wait2(op: u32, addr: ?*const c_void, val: u64, timeout_us: u32, val2: u64) c_int;
 pub extern "c" fn __ulock_wait(op: u32, addr: ?*const c_void, val: u64, timeout_us: u32) c_int;
 pub extern "c" fn __ulock_wake(op: u32, addr: ?*const c_void, val: u64) c_int; 
+
+pub const OS_UNFAIR_LOCK_INIT = os_unfair_lock{};
+pub const os_unfair_lock_t = *os_unfair_lock;
+pub const os_unfair_lock = extern struct {
+    _os_unfair_lock_opaque: u32 = 0,
+};
+
+pub extern "c" fn os_unfair_lock_lock(o: os_unfair_lock_t) void;
+pub extern "c" fn os_unfair_lock_unlock(o: os_unfair_lock_t) void;
+pub extern "c" fn os_unfair_lock_trylock(o: os_unfair_lock_t) bool;
+pub extern "c" fn os_unfair_lock_assert_owner(o: os_unfair_lock_t) void;
+pub extern "c" fn os_unfair_lock_assert_not_owner(o: os_unfair_lock_t) void;

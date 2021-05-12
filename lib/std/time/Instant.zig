@@ -15,6 +15,8 @@
 
 const std = @import("../../std.zig");
 const target = std.Target.current;
+
+const Duration = std.time.Duration;
 const Instant = @This();
 
 timestamp: u64,
@@ -40,6 +42,32 @@ pub fn since(self: Instant, earlier: Instant) ?u64 {
     return CpuClock.getElapsed(delta) orelse OsClock.getElapsed(delta);
 }
 
+/// Create an Instant which is observed to happen `duration` after `self`.
+/// Returns null on overflow.
+pub fn after(self: Instant, duration: Duration) ?Instant {
+    const units = CpuClock.fromDuration(duration) orelse OsClock.fromDuration(duration); 
+
+    var timestamp = self.timestamp;
+    if (@addWithOverflow(u64, self.timestamp, units, &timestamp)) {
+        return null;
+    }
+
+    return Instant{ .timestamp = timestamp };
+}
+
+/// Create an Instant which is observed to happen `duration` before `self`.
+/// Returns null on overflow.
+pub fn before(self: Instant, duration: Duration) ?Instant {
+    const units = CpuClock.fromDuration(duration) orelse OsClock.fromDuration(duration); 
+
+    var timestamp = self.timestamp;
+    if (@subWithOverflow(u64, self.timestamp, units, &timestamp)) {
+        return null;
+    }
+
+    return Instant{ .timestamp = timestamp };
+}
+
 /// An Instant clock source which uses the CPU.
 /// When available, this is preferred over `OsClock` due to potentially faster sampling.
 const CpuClock = switch (target.cpu.arch) {
@@ -50,6 +78,10 @@ const CpuClock = switch (target.cpu.arch) {
         }
 
         pub fn getElapsed(delta: u64) ?u64 {
+            return null;
+        }
+
+        pub fn fromDuration(duration: Duration) ?u64 {
             return null;
         }
     },
@@ -158,11 +190,23 @@ const Intel64Clock = struct {
     pub fn getElapsed(delta: u64) ?u64 {
         switch (@atomicLoad(Status, &tsc_status, .Acquire)) {
             .Uninit => unreachable,
-            .Unsupported => null,
+            .Unsupported => return null,
             .Supported => {
                 const ticks_per_ns = @bitCast(f64, tsc_scale);
                 const elapsed = @intToFloat(f64, delta) / ticks_per_ns;
                 return @floatToInt(u64, elapsed);
+            },
+        }
+    }
+
+    pub fn fromDuration(duration: Duration) ?u64 {
+        switch (@atomicLoad(Status, &tsc_status, .Acquire)) {
+            .Uninit => unreachable,
+            .Unsupported => return null,
+            .Supported => {
+                const ticks_per_ns = @bitCast(f64, tsc_scale);
+                const ticks = @intToFloat(f64, duration.asNanos()) * ticks_per_ns;
+                return @floatToInt(u64, ticks);
             },
         }
     }
@@ -189,48 +233,69 @@ else
     @compileError("OsClock source not detected");
 
 const PosixClock = struct {
-    fn read() u64 {
+    pub fn read() u64 {
         var ts: std.os.timespec = undefined;
         std.os.clock_gettime(std.os.CLOCK_MONOTONIC, &ts) catch return 0;
         return (@intCast(u64, ts.tv_sec) * std.time.ns_per_s) + @intCast(u64, ts.tv_nsec);
     }
 
-    fn getElapsed(delta: u64) u64 {
+    pub fn getElapsed(delta: u64) u64 {
         return delta;
+    }
+    
+    pub fn fromDuration(duration: Duration) ?u64 {
+        return duration.asNanos();
     }
 };
 
 const DarwinClock = struct {
-    fn read() u64 {
+    pub fn read() u64 {
         return std.os.darwin.mach_absolute_time();
     }
 
     var info = std.mem.zeroes(std.os.darwin.mach_timebase_info_data);
+    
+    fn loadInfo() callconv(.Inline) void {
+        if (@atomicLoad(u32, &info.numer, .Unordered) != 0) return;
+        const status = std.os.darwin.mach_timebase_info(&info);
+        std.debug.assert(status == std.os.darwin.KERN_SUCCESS);
+    }
 
-    fn getElapsed(delta: u64) u64 {
-        if (@atomicLoad(u32, &info.numer, .Unordered) == 0) {
-            const status = std.os.darwin.mach_timebase_info(&info);
-            if (status != std.os.darwin.KERN_SUCCESS) {
-                return 0;
-            }
-        }
+    pub fn getElapsed(delta: u64) u64 {
+        loadInfo();
 
         var duration = delta;
         if (info.numer > 1) duration *= info.numer;
         if (info.denom > 1) duration /= info.denom;
         return duration;
     }
+
+    pub fn fromDuration(duration: Duration) u64 {
+        loadInfo();
+
+        var ticks = duration.asNanos();
+        ticks *= info.denom;
+        ticks /= info.numer;
+        return ticks;
+    }
 };
 
 const WindowsClock = struct {
-    fn read() u64 {
+    pub fn read() u64 {
         return std.os.windows.QueryPerformanceCounter();
     }
 
-    fn getElapsed(delta: u64) u64 {
+    pub fn getElapsed(delta: u64) u64 {
         var duration: u128 = delta;
         duration *= std.time.ns_per_s;
         duration /= getFrequency();
+        return std.math.cast(u64, duration) catch std.math.maxInt(u64);
+    }
+
+    pub fn fromDuration(duration: Duration) u64 {
+        var ticks: u128 = duration.asNanos();
+        duration *= getFrequency();
+        duration /= std.time.ns_per_s;
         return std.math.cast(u64, duration) catch std.math.maxInt(u64);
     }
 
