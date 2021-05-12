@@ -29,17 +29,23 @@ pub fn now() Instant {
     return .{ .timestamp = CpuClock.read() orelse OsClock.read() };
 }
 
-/// Return the amount of nanoseconds in wall-clock time that have elapsed
-/// since the given `earlier` Instant. If the `earlier` Instant was actually 
-/// "later" than the `self` Instant, null is returned.
-pub fn since(self: Instant, earlier: Instant) ?u64 {
+/// Return the ordering between two Instants
+pub fn order(self: Instant, other: Instant) std.math.Order {
+    return std.math.order(self.timestamp, other.timestamp);
+}
+
+/// Return the Duration in wall-clock time that has elapsed since the given `earlier` Instant. 
+/// If the `earlier` Instant was actually "later" than the `self` Instant, null is returned.
+pub fn since(self: Instant, earlier: Instant) ?Duration {
     var delta: u64 = undefined;
     if (@subWithOverflow(u64, self.timestamp, earlier.timestamp, &delta)) {
         return null;
     }
 
-    if (delta == 0) return 0;
-    return CpuClock.getElapsed(delta) orelse OsClock.getElapsed(delta);
+    return Duration.fromNanos(blk: {
+        if (delta == 0) break :blk 0;
+        break :blk CpuClock.getElapsed(delta) orelse OsClock.getElapsed(delta);
+    });
 }
 
 /// Create an Instant which is observed to happen `duration` after `self`.

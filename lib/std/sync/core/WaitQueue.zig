@@ -24,7 +24,7 @@ pub fn WaitQueue(comptime sync: anytype) type {
         pub const WaitLock: type = sync.LockImpl;
         pub const WaitEvent: type = sync.EventImpl;
         pub const WaitInstant: type = sync.InstantImpl;
-        pub const bucket_count: usize = sync.num_shards;
+        pub const bucket_count: usize = sync.bucket_count;
 
         pub const Waking = WakingType;
         pub const Waiting = WaitingType;
