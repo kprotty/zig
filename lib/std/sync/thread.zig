@@ -7,12 +7,16 @@
 const std = @import("../../std.zig");
 const target = std.Target.current;
 const assert = std.debug.assert;
-
 const Instant = std.time.Instant;
 const Duration = std.time.Duration;
-const CoreWaitQueue = @import("./core.zig").WaitQueue;
 
-pub const WaitQueue = if (target.os.tag == .windows)
+const atomic = @import("./atomic.zig");
+const generic = @import("./generic.zig");
+const CoreWaitQueue = generic.core.WaitQueue;
+
+pub usingnamespace generic.primitivesFor(OsWaitQueue);    
+    
+const OsWaitQueue = if (target.os.tag == .windows)
     WindowsWaitQueue
 else if (target.os.tag == .linux)
     LinuxWaitQueue
@@ -173,9 +177,249 @@ const WindowsWaitQueue = struct {
         pub const InstantImpl = Instant;
         pub const bucket_count: usize = @as(windows.PEB, undefined).WaitOnAddressHashTable.len;
 
-        const NtKeyedLock = @compileError("TODO");
+        const KeyedEvent = struct {
+            var global_handle: ?windows.HANDLE = windows.INVALID_HANDLE_VALUE;
 
-        const NtKeyedEvent = @compileError("TODO");
+            fn getHandle() ?windows.HANDLE {
+                const handle = atomic.load(&global_handle, .Relaxed) orelse return null;
+                if (handle != windows.INVALID_HANDLE_VALUE) return handle;
+                return getHandleSlow();
+            }
+
+            fn getHandleSlow() ?windows.HANDLE {
+                @setCold(true);
+
+                var handle: windows.HANDLE = undefined;
+                const access_mask = windows.GENERIC_READ | windows.GENERIC_WRITE;
+                const status = windows.ntdll.NtCreateKeyedEvent(&handle, access_mask, null, 0);
+                
+                // NULL keyed event handle is valid and represents the system wide keyed event handle
+                const new_handle = return switch (status) {
+                    .SUCCESS => handle,
+                    else => null,
+                };
+
+                // Try to racily update the global handle with the new one we just made
+                const current_handle = atomic.compareAndSwap(
+                    &global_handle,
+                    windows.INVALID_HANDLE_VALUE,
+                    new_handle,
+                    .Relaxed,
+                    .Relaxed,
+                ) orelse return new_handle;
+
+                // If we failed the race, destroy the new handle we made
+                windows.CloseHandle(new_handle);
+                return current_handle;
+            }
+
+            fn wait(ptr: anytype, duration: ?Duration) void {
+                var timeout_ptr: ?*windows.LARGE_INTEGER = null;
+                var timeout_value: windows.LARGE_INTEGER = undefined;
+
+                // NtWaitForKeyedEvent uses timeout unit where
+                // - negative values indicate a relative timeout
+                // - the value is in units of 100 nanoseconds
+                if (duration) |timeout| {
+                    timeout_ptr = &timeout_value;
+                    timeout_value = -@intCast(windows.LARGE_INTEGER, timeout.asNanos() / 100);
+                }
+                
+                const status = windows.ntdll.NtWaitForKeyedEvent(
+                    KeyedEvent.getHandle(),
+                    @ptrCast(*const c_void, ptr),
+                    windows.FALSE, // non-alertable wait
+                    timeout_ptr,
+                );
+
+                switch (status) {
+                    .SUCCESS => {},
+                    .TIMEOUT => {},
+                    else => unreachable,
+                }
+            }
+
+            fn notify(ptr: anytype) void {
+                const status = windows.ntdll.NtReleaseKeyedEvent(
+                    KeyedEvent.getHandle(),
+                    @ptrCast(*const c_void, ptr),
+                    windows.FALSE, // non-alertable wait
+                    null,
+                );
+                assert(status == .SUCCESS);
+            }
+        }
+
+        const NtKeyedLock = struct {
+            state: usize = 0,
+
+            const LOCKED: usize = 1 << 0;
+            const WAKING: usize = 1 << 1;
+            const WAITING: usize = 1 << 2;
+
+            fn tryAcquire(self: *NtKeyedLock) callconv(.Inline) bool {
+                return atomic.bitSet(
+                    &self.state,
+                    @ctz(usize, LOCKED),
+                    .Acquire,
+                ) == 0;
+            }
+            
+            pub fn acquire(self: *NtKeyedLock) void {
+                if (!self.tryAcquire()) {
+                    self.acquireSlow();
+                }
+            }
+
+            fn acquireSlow(self: *NtKeyedLock) void {
+                @setCold(true);
+
+                var adaptive_spin: usize = 0;
+                var state = atomic.load(&self.state, .Relaxed);
+
+                while (true) {
+                    if (state & LOCKED == 0) {
+                        if (self.tryAcquire()) {
+                            return;
+                        }
+
+                        _ = windows.kernel32.SwitchToThread();
+                        state = atomic.load(&self.state, .Relaxed);
+                        continue;
+                    }
+
+                    if ((state < WAITING) and (adaptive_spin < 4000)) {
+                        atomic.spinLoopHint();
+                        adaptive_spin += 1;
+                        state = atomic.load(&self.state, .Relaxed);
+                        continue;
+                    }
+
+                    var new_state: usize = undefined;
+                    if (@addWithOverflow(usize, state, WAITING, &new_state)) {
+                        unreachable; // Too many waiters on the same lock
+                    }
+
+                    if (atomic.tryCompareAndSwap(
+                        &self.state,
+                        state,
+                        new_state,
+                        .Relaxed,
+                        .Relaxed,
+                    )) |updated| {
+                        state = updated;
+                        continue;
+                    }
+
+                    KeyedEvent.wait(&self.state, null);
+
+                    adaptive_spin = 0;
+                    state = atomic.fetchSub(&self.state, WAITING | WAKING, .Relaxed);
+                    state -= WAITING | WAKING;
+                }
+            }
+
+            pub fn release(self: *NtKeyedLock) void {
+                const state = atomic.fetchSub(&self.state, LOCKED, .Release);
+                if ((state >= WAITING) and (state & WAKING == 0)) {
+                    self.releaseSlow();
+                }
+            }
+
+            fn releaseSlow(self: *NtKeyedLock) void {
+                @setCold(true);
+
+                var state = atomic.load(&self.state, .Relaxed);
+                while (true) {
+                    if ((state < WAITING) or (state & WAKING != 0)) {
+                        return;
+                    }
+
+                    state = atomic.tryCompareAndSwap(
+                        &self.state,
+                        state,
+                        state | WAKING,
+                        .Relaxed,
+                        .Relaxed,
+                    ) orelse {
+                        KeyedEvent.notify(&self.state);
+                        return;
+                    };
+                }
+            }
+        };
+
+        const NtKeyedEvent = struct {
+            state: State = .empty,
+
+            const State = enum(usize) {
+                empty,
+                waiting,
+                notified,
+            };
+
+            pub fn init(self: *NtKeyedEvent) void {
+                self.* = .{};
+            }
+
+            pub fn deinit(self: *NtKeyedEvent) void {
+                assert(self.state != .waiting);
+                self.* = undefined;
+            }
+
+            pub fn wait(self: *NtKeyedEvent, deadline: ?Instant) error{TimedOut}!void {
+                if (atomic.compareAndSwap(
+                    &self.state,
+                    .empty,
+                    .waiting,
+                    .Acquire,
+                    .Acquire,
+                )) |state| {
+                    assert(state == .notified);
+                    return;
+                }
+
+                const instant = deadline orelse {
+                    KeyedEvent.wait(&self.state, null);
+                    assert(self.state == .notified);
+                    return;
+                };
+
+                var timed_out = false;
+                const duration = instant.since(Instant.now()) orelse blk: {
+                    timed_out = true;
+                    break :blk undefined;
+                };
+
+                if (!timed_out) {
+                    KeyedEvent.wait(&self.state, duration);
+                    timed_out = instant.since(Instant.now()) == null;
+                }
+
+                if (!timed_out) {
+                    assert(self.state == .notified);
+                    return;
+                }
+
+                const state = atomic.compareAndSwap(
+                    &self.state,
+                    .waiting,
+                    .empty,
+                    .Acquire,
+                    .Acquire,
+                ) orelse return error.TimedOut;
+                assert(state == .notified);
+                return;
+            }
+
+            pub fn set(self: *NtKeyedEvent) void {
+                switch (atomic.swap(&self.state, .notified, .Release)) {
+                    .empty => {},
+                    .waiting => KeyedEvent.notify(&self.state),
+                    .notified => unreachable, // Event was notified more than once
+                }
+            }
+        };
     });
 };
 
@@ -195,7 +439,7 @@ const DarwinFutex = struct {
         pub const LockImpl = UnfairLockImpl;
         pub const EventImpl = PosixWaitQueue.WaitEvent;
         pub const InstantImpl = PosixWaitQueue.WaitInstant;
-        pub const bucket_count: usize = 32; // conservative towards bad macho linkers
+        pub const bucket_count = PosixWaitQueue.bucket_count;
 
         const UnfairLockImpl = struct {
             oul: darwin.os_unfair_lock = .{},
@@ -213,7 +457,13 @@ const DarwinFutex = struct {
     });
 
     const UlockFutex = struct {
-        pub const is_supported = @compileError("TODO");
+        pub const is_supported = switch (target.os.tag) {
+            .macos => darwin_version.isAtLeast(.{ .major = 10, .minor = 12 }),
+            .ios => darwin_version.isAtLeast(.{ .major = 10, .minor = 0 }),
+            .tvos => darwin_version.isAtLeast(.{ .major = 10, .minor = 0 }),
+            .watchos => darwin_version.isAtLeast(.{ .major = 3, .minor = 0 }),
+            else => false,
+        };
 
         pub const bucket_count: usize = PosixWaitQueue.bucket_count;
 
@@ -288,8 +538,10 @@ const PosixWaitQueue = MutexCondWaitQueue(struct {
     /// https://github.com/facebook/folly/blob/bd600cd4e88f664f285489c76b6ad835d8367cd2/folly/synchronization/ParkingLot.cpp#L25
     pub const bucket_count: usize = if (is_mobile) 256 else 4096;
     
-    const is_mobile = target.isAndroid() or (target.os.tag == .ios) or is_low_power_device;
-    const is_low_power_device = @compileError("TODO");
+    const is_mobile = target.isAndroid() or is_ios or is_low_power_device;
+    const is_ios = target.os.tag == .ios;
+    const is_low_power_device = arch.isARM() or arch.isThumb() or arch.isWasm() or arch.isMIPS();
+    const arch = target.cpu.arch;
 
     pub const MutexImpl = struct {
         mutex: std.c.pthread_mutex_t = .{},
@@ -368,6 +620,7 @@ const PosixWaitQueue = MutexCondWaitQueue(struct {
     };
 });
 
+/// Implements a CoreWaitQueue backed by a Mutex and Condvar implementation
 fn MutexCondWaitQueue(comptime MutexCondImpl: type) type {
     return CoreWaitQueue(struct {
         pub const LockImpl = MutexCondImpl.MutexImpl;
@@ -375,10 +628,79 @@ fn MutexCondWaitQueue(comptime MutexCondImpl: type) type {
         pub const InstantImpl = Instant;
         pub const bucket_count = MutexCondImpl.bucket_count;
 
-        const MutexCondEvent = @compileError("TODO");
+        const MutexCondEvent = struct {
+            state: State = .empty,
+            mutex: MutexCondImpl.MutexImpl,
+            cond: MutexCondImpl.CondImpl,
+
+            const State = enum{
+                empty,
+                waiting,
+                notified,
+            };
+
+            pub fn init(self: *MutexCondEvent) void {
+                self.* = .{};
+            }
+
+            pub fn deinit(self: *MutexCondEvent) void {
+                assert(self.state != .waiting);
+                self.mutex.deinit();
+                self.cond.deinit();
+                self.* = undefined;
+            }
+
+            pub fn wait(self: *MutexCondEvent, deadline: ?Instant) error{TimedOut}!void {
+                self.mutex.acquire();
+                defer self.mutex.release();
+
+                switch (self.state) {
+                    .empty => self.state = .waiting,
+                    .waiting => unreachable, // multiple threads waiting on same Event
+                    .notified => return,
+                }
+
+                while (true) {
+                    assert(self.state == .waiting);
+
+                    var timeout: ?Duration = null;
+                    if (deadline) |instant| {
+                        timeout = instant.since(Instant.now()) orelse {
+                            self.state = .empty;
+                            return error.TimedOut;
+                        };
+                    }
+
+                    self.cond.wait(&self.mutex, timeout);
+                    switch (self.state) {
+                        .empty => unreachable, // Event was unset while a thread was waiting
+                        .waiting => {},
+                        .notified => return,
+                    }
+                }
+            }
+
+            pub fn set(self: *MutexCondEvent) void {
+                self.mutex.acquire();
+                defer self.mutex.release();
+
+                switch (self.state) {
+                    .empty => self.state = .notified,
+                    .waiting => {
+                        // Signal the condition variable with the mutex held since,
+                        // when the mutex is unlocked, the Event waiter could wake up,
+                        // see self.state == .notified, stop waiting and deallocate the Event object.
+                        self.state = .notified;
+                        self.cond.signal();
+                    },
+                    .notified => unreachable, // Event was set more than once
+                }
+            }
+        };
     });
 }
 
+/// Implements a CoreWaitQueue backed by a Futex implementaiton
 fn FutexWaitQueue(comptime FutexImpl: type) type {
     return CoreWaitQueue(struct {
         pub const LockImpl = FutexLock;
@@ -386,8 +708,160 @@ fn FutexWaitQueue(comptime FutexImpl: type) type {
         pub const InstantImpl = Instant;
         pub const bucket_count = FutexImpl.bucket_count;
 
-        const FutexLock = @compileError("TODO");
+        const FutexLock = struct {
+            state: State = .unlocked,
 
-        const FutexEvent = @compileError("TODO");
+            const State = enum(u32) {
+                unlocked,
+                locked,
+                contended,
+            };
+
+            pub fn acquire(self: *FutexLock) void {
+                if (atomic.tryCompareAndSwap(
+                    &self.state,
+                    .unlocked,
+                    .locked,
+                    .Acquire,
+                    .Relaxed,
+                )) |_| {
+                    self.acquireSlow();
+                }
+            }
+
+            fn acquireSlow(self: *FutexLock) void {
+                @setCold(true);
+
+                var adaptive_spin: u8 = 0;
+                var new_state = State.locked;
+                var state = atomic.load(&self.state, .Relaxed);
+                
+                while (true) {
+                    if (state == .unlocked) {
+                        state = atomic.tryCompareAndSwap(
+                            &self.state,
+                            state,
+                            new_state,
+                            .Acquire,
+                            .Relaxed,
+                        ) orelse return;
+                        continue;
+                    }
+
+                    if (state != .contended) {
+                        if (adaptive_spin < 5) {
+                            var spin = @as(usize, 1) << @intCast(std.math.Log2Int(usize), adaptive_spin);
+                            while (spin > 0) : (spin -= 1) {
+                                atomic.spinLoopHint();
+                            }
+
+                            adaptive_spin += 1;
+                            state = atomic.load(&self.state, .Relaxed);
+                            continue;
+                        }
+
+                        if (atomic.tryCompareAndSwap(
+                            &self.state,
+                            state,
+                            new_state,
+                            .Acquire,
+                            .Relaxed,
+                        )) |updated| {
+                            state = updated;
+                            continue;
+                        }
+                    }
+
+                    _ = FutexImpl.wait(
+                        @ptrCast(*const u32, &self.state),
+                        @enumToInt(State.contended),
+                        null,
+                    ) catch unreachable;
+
+                    adaptive_spin = 0;
+                    new_state = .contended;
+                    state = atomic.load(&self.state, .Relaxed);
+                }
+            }
+
+            pub fn release(self: *FutexLock) void {
+                switch (atomic.swap(&self.state, .unlocked, .Release)) {
+                    .unlocked => unreachable, // unlocked an unlocked Mutex
+                    .locked => {}, // unlocked a locked Mutex (the expected)
+                    .contended => { // unlocked a Mutex with (possibly) pending waiters
+                        const ptr = @ptrCast(*const u32, &self.state);
+                        FutexImpl.wake(ptr, 1);
+                    },
+                }
+            }
+        };
+
+        const FutexEvent = struct {
+            state: State = .empty,
+
+            const State = enum(u32){
+                empty,
+                waiting,
+                notified,
+            };
+
+            pub fn init(self: *MutexCondEvent) void {
+                self.* = .{};
+            }
+
+            pub fn deinit(self: *MutexCondEvent) void {
+                assert(self.state != .waiting);
+                self.* = undefined;
+            }
+
+            pub fn wait(self: *MutexCondEvent, deadline: ?Instant) error{TimedOut}!void {
+                if (atomic.compareAndSwap(&self.state, .empty, .waiting, .Acquire, .Acquire)) |state| {
+                    assert(state == .notified);
+                    return;
+                }
+
+                while (true) {
+                    var timeout: ?Duration = null;
+                    if (deadline) |instant| {
+                        timeout = instant.since(Instant.now()) orelse {
+                            const state = atomic.compareAndSwap(
+                                &self.state,
+                                .waiting,
+                                .empty,
+                                .Acquire,
+                                .Acquire,
+                            ) orelse return error.TimedOut;
+                            assert(state == .notified);
+                            return;
+                        };
+                    }
+
+                    _ = FutexImpl.wait(
+                        @ptrCast(*const u32, &self.state),
+                        @enumToInt(State.waiting),
+                        timeout,
+                    ) catch {
+                        assert(timeout != null);
+                    };
+
+                    switch (atomic.load(&self.state, .Relaxed)) {
+                        .empty => unreachable, // Event is unset while there's a waiter
+                        .waiting => {},
+                        .notified => return,
+                    }
+                }
+            }
+
+            pub fn set(self: *MutexCondEvent) void {
+                switch (atomic.swap(&self.state, .notified, .Release)) {
+                    .empty => {},
+                    .waiting => {
+                        const ptr = @ptrCast(*const u32, &self.state);
+                        FutexImpl.wake(ptr, 1);
+                    },
+                    .notified => unreachable, // Event was set multiple times
+                }
+            }
+        };
     });
 }

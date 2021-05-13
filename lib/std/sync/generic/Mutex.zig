@@ -24,13 +24,12 @@ pub fn Mutex(comptime WaitQueue: type) type {
         };
 
         pub fn tryAcquire(self: *Self) ?Held {
-            return @cmpxchgStrong(
-                State,
+            return atomic.compareAndSwap(
                 &self.state,
                 .unlocked,
                 .locked,
                 .Acquire,
-                .Monotonic,
+                .Relaxed,
             ) == null;
         }
 
@@ -58,13 +57,12 @@ pub fn Mutex(comptime WaitQueue: type) type {
             self: *Self, 
             deadline: ?WaitQueue.Instant,
         ) callconv(.Inline) error{TimedOut}!Held {
-            if (@cmpxchgWeak(
-                State,
+            if (atomic.tryCompareAndSwap(
                 &self.state,
                 .unlocked,
                 .locked,
                 .Acquire,
-                .Monotonic,
+                .Relaxed,
             )) |failed| {
                 try self.acquireSlow(deadline);
             }
@@ -80,17 +78,16 @@ pub fn Mutex(comptime WaitQueue: type) type {
             
             var adaptive_spin: u8 = 0;
             var new_state = State.locked;
-            var state = @atomicLoad(State, &self.state, .Monotonic);
+            var state = atomic.load(&self.state, .Relaxed);
 
             while (true) {
                 if (state == .unlocked) {
-                    state = @cmpxchgWeak(
-                        State,
+                    state = atomic.tryCompareAndSwap(
                         &self.state,
                         state,
                         new_state,
                         .Acquire,
-                        .Monotonic,
+                        .Relaxed,
                     ) orelse return;
                     continue;
                 }
@@ -103,17 +100,16 @@ pub fn Mutex(comptime WaitQueue: type) type {
                         }
 
                         adaptive_spin += 1;
-                        state = @atomicLoad(State, &self.state, .Monotonic);
+                        state = atomic.load(&self.state, .Relaxed);
                         continue;
                     }
 
-                    if (@cmpxchgWeak(
-                        State,
+                    if (atomic.tryCompareAndSwap(
                         &self.state,
                         state,
                         .contended,
-                        .Monotonic,
-                        .Monotonic,
+                        .Relaxed,
+                        .Relaxed,
                     )) |updated| {
                         state = updated;
                         continue;
@@ -124,7 +120,7 @@ pub fn Mutex(comptime WaitQueue: type) type {
                     mutex: *Self,
 
                     pub fn onValidate(this: @This()) ?usize {
-                        const current_state = @atomicLoad(State, &this.mutex.state, .Monotonic);
+                        const current_state = atomic.load(&this.mutex.state, .Relaxed);
                         if (current_state != .contended) return null;
                         return 0;
                     }
@@ -147,7 +143,7 @@ pub fn Mutex(comptime WaitQueue: type) type {
                     .Retry => {
                         adaptive_spin = 0;
                         new_state = .contended;
-                        state = @atomicLoad(State, &self.state, .Monotonic);
+                        state = atomic.load(&self.state, .Relaxed);
                         continue;
                     }
                 }
@@ -171,7 +167,7 @@ pub fn Mutex(comptime WaitQueue: type) type {
                 return self.releaseSlow(Notify.Acquired);
             }
 
-            switch (@atomicRmw(State, &self.state, .Xchg, .unlocked, .Release)) {
+            switch (atomic.swap(&self.state, .unlocked, .Release)) {
                 .unlocked => unreachable, // unlocked an unlocked Mutex
                 .locked => {},
                 .contended => _ = self.releaseSlow(Notify.Retry),
@@ -197,10 +193,10 @@ pub fn Mutex(comptime WaitQueue: type) type {
                 pub fn onBeforeWake(this: @This()) void {
                     if (notify == .Acquired and !self.did_wake) {
                         if (std.debug.runtime_safety) {
-                            const state = @atomicLoad(State, &self.mutex.state, .Unordered);
+                            const state = atomic.load(&self.mutex.state, .Unordered);
                             std.debug.assert(state == .locked);
                         }
-                        @atomicStore(State, &self.mutex.state, .unlocked, .Release);
+                        atomic.store(&self.mutex.state, .unlocked, .Release);
                     }
                 }
             };

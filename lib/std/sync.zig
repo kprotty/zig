@@ -4,6 +4,18 @@
 // The MIT license requires this copyright notice to be included in all copies
 // and substantial portions of the software.
 
-pub const core = @import("sync/core.zig");
-pub const futex = @import("sync/futex.zig");
+const root = @import("root");
+
 pub const atomic = @import("sync/atomic.zig");
+pub const generic = @import("sync/generic.zig");
+pub const event = @import("sync/event.zig");
+pub const thread = @import("sync/thread.zig");
+
+pub usingnamespace if (@hasDecl(root, "sync"))
+    root.sync
+else if (std.io.is_async)
+    event
+else if (target.os.tag != .freestanding)
+    thread
+else
+    struct {};

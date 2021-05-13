@@ -239,7 +239,7 @@ pub fn WaitQueue(comptime sync: anytype) type {
 
             fn from(address: usize) *WaitBucket {
                 const seed = 0x9E3779B97F4A7C15 >> (64 - bitCount(usize));
-                const index = (address *% seed) % buckets.len;
+                const index = (address *% seed) % bucket_count;
                 return &buckets[index];
             }
         };
