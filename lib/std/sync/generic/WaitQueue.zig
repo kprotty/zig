@@ -7,16 +7,17 @@
 const std = @import("../../std.zig");
 const bitCount = std.meta.bitCount;
 const assert = std.debug.assert;
+const is_single_threaded = std.builtin.single_threaded;
 
 pub const WaitingType = struct {
-    token: usize,
-    is_last: bool,
+    token: *usize,
+    next: ?*usize,
 };
 
-pub const WakingType = union(enum) {
+pub const WakingType = union {
     Stop,
     Skip,
-    Wake: usize,
+    Wake,
 };
 
 pub fn WaitQueue(comptime sync: anytype) type {
@@ -248,7 +249,7 @@ pub fn WaitQueue(comptime sync: anytype) type {
             address: usize,
             deadline: ?WaitInstant,
             context: anytype,
-        ) error{Invalidated, TimedOut}!usize {
+        ) error{Invalidated, TimedOut}!void {
             @setCold(true);
 
             const bucket = WaitBucket.from(address);
@@ -277,8 +278,8 @@ pub fn WaitQueue(comptime sync: anytype) type {
                     list = WaitList.from(&bucket.tree, address);
                     list.remove(&wait_node);
                     context.onTimedOut(Waiting{
-                        .token = wait_node.token,
-                        .is_last = list.head == null,
+                        .token = &wait_node.token,
+                        .next = if (list.head) |node| &node.token else null,
                     });
                 }
 
@@ -286,8 +287,6 @@ pub fn WaitQueue(comptime sync: anytype) type {
                 if (timed_out) return error.TimedOut;
                 wait_node.event.wait(null) catch unreachable;
             };
-
-            return wait_node.token;
         }
 
         pub fn wake(
@@ -307,16 +306,15 @@ pub fn WaitQueue(comptime sync: anytype) type {
                 current = node.next;
 
                 const waking: Waking = context.onWake(Waiting{
-                    .token = node.token,
-                    .is_last = current == null,
+                    .token = &node.token,
+                    .next = if (current) |next| &next.token else null,
                 });
 
                 switch (waking) {
                     .Stop => break,
                     .Skip => continue,
-                    .Unpark => |token| {
+                    .Unpark => {
                         list.remove(node);
-                        node.token = token;
                         node.next = unparked;
                         unparked = node;
                     },

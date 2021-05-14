@@ -763,22 +763,38 @@ pub const Loop = struct {
     }
 
     pub fn sleep(self: *Loop, nanoseconds: u64) void {
-        if (std.builtin.single_threaded)
-            @compileError("TODO: integrate timers with epoll/kevent/iocp for single-threaded");
-
         suspend {
-            const now = self.delay_queue.timer.read();
+            var delay: Delay = undefined;
+            delay.schedule(self, @frame(), nanoseconds);
+        }
+    }
 
-            var entry: DelayQueue.Waiters.Entry = undefined;
-            entry.init(@frame(), now + nanoseconds);
-            self.delay_queue.waiters.insert(&entry);
+    pub const Delay = struct {
+        entry: DelayQueue.Waiters.Entry,
+        loop: *Loop,
+
+        pub fn schedule(self: *Delay, loop: *Loop, frame: anyframe, nanoseconds: u64) void {
+            if (std.builtin.single_threaded) {
+                @compileError("TODO: integrate timers with epoll/kevent/iocp for single-threaded");
+            }
+            
+            // Safe to be called by multiple threads
+            const now = loop.delay_queue.timer.read();
+
+            self.loop = loop;
+            self.entry.init(frame, now + nanoseconds);
+            loop.delay_queue.waiters.insert(&self.entry);
 
             // Speculatively wake up the timer thread when we add a new entry.
             // If the timer thread is sleeping on a longer entry, we need to
             // interrupt it so that our entry can be expired in time.
-            self.delay_queue.event.set();
+            loop.delay_queue.event.set();
         }
-    }
+
+        pub fn cancel(self: *Delay) bool {
+            return self.loop.delay_queue.waiters.remove(&self.entry);
+        }
+    };
 
     const DelayQueue = struct {
         timer: std.time.Timer,
@@ -842,7 +858,12 @@ pub const Loop = struct {
 
             /// Registers the entry into the queue of waiting frames
             fn insert(self: *Waiters, entry: *Entry) void {
-                self.entries.put(&entry.node);
+                return self.entries.put(&entry.node);
+            }
+
+            /// Tries to remove an entry in the queue of waiting frames
+            fn remove(self: *Waiters, entry: *Entry) bool {
+                return self.entries.remove(&entry.node);
             }
 
             /// Dequeues one expired event relative to `now`

@@ -173,7 +173,7 @@ const WindowsWaitQueue = struct {
 
     const NtKeyedEventWaitQueue = CoreWaitQueue(struct {
         pub const LockImpl = NtKeyedLock;
-        pub const EventImpl = NtKeyedEvent;
+        pub const EventImpl = ThreadEvent(NtKeyedEvent);
         pub const InstantImpl = Instant;
         pub const bucket_count: usize = @as(windows.PEB, undefined).WaitOnAddressHashTable.len;
 
@@ -253,11 +253,16 @@ const WindowsWaitQueue = struct {
         const NtKeyedLock = struct {
             state: usize = 0,
 
+            const Self = @This();
             const LOCKED: usize = 1 << 0;
             const WAKING: usize = 1 << 1;
             const WAITING: usize = 1 << 2;
 
-            fn tryAcquire(self: *NtKeyedLock) callconv(.Inline) bool {
+            pub fn deinit(self: *Self) void {
+                self.* = undefined;
+            }
+
+            fn tryAcquire(self: *Self) callconv(.Inline) bool {
                 return atomic.bitSet(
                     &self.state,
                     @ctz(usize, LOCKED),
@@ -265,13 +270,13 @@ const WindowsWaitQueue = struct {
                 ) == 0;
             }
             
-            pub fn acquire(self: *NtKeyedLock) void {
+            pub fn acquire(self: *Self) void {
                 if (!self.tryAcquire()) {
                     self.acquireSlow();
                 }
             }
 
-            fn acquireSlow(self: *NtKeyedLock) void {
+            fn acquireSlow(self: *Self) void {
                 @setCold(true);
 
                 var adaptive_spin: usize = 0;
@@ -319,14 +324,14 @@ const WindowsWaitQueue = struct {
                 }
             }
 
-            pub fn release(self: *NtKeyedLock) void {
+            pub fn release(self: *Self) void {
                 const state = atomic.fetchSub(&self.state, LOCKED, .Release);
                 if ((state >= WAITING) and (state & WAKING == 0)) {
                     self.releaseSlow();
                 }
             }
 
-            fn releaseSlow(self: *NtKeyedLock) void {
+            fn releaseSlow(self: *Self) void {
                 @setCold(true);
 
                 var state = atomic.load(&self.state, .Relaxed);
@@ -352,22 +357,23 @@ const WindowsWaitQueue = struct {
         const NtKeyedEvent = struct {
             state: State = .empty,
 
+            const Self = @This();
             const State = enum(usize) {
                 empty,
                 waiting,
                 notified,
             };
 
-            pub fn init(self: *NtKeyedEvent) void {
+            pub fn init(self: *Self) void {
                 self.* = .{};
             }
 
-            pub fn deinit(self: *NtKeyedEvent) void {
+            pub fn deinit(self: *Self) void {
                 assert(self.state != .waiting);
                 self.* = undefined;
             }
 
-            pub fn wait(self: *NtKeyedEvent, deadline: ?Instant) error{TimedOut}!void {
+            pub fn wait(self: *Self, deadline: ?Instant) error{TimedOut}!void {
                 if (atomic.compareAndSwap(
                     &self.state,
                     .empty,
@@ -412,7 +418,7 @@ const WindowsWaitQueue = struct {
                 return;
             }
 
-            pub fn set(self: *NtKeyedEvent) void {
+            pub fn set(self: *Self) void {
                 switch (atomic.swap(&self.state, .notified, .Release)) {
                     .empty => {},
                     .waiting => KeyedEvent.notify(&self.state),
@@ -445,6 +451,10 @@ const DarwinFutex = struct {
             oul: darwin.os_unfair_lock = .{},
             
             pub const is_supported = UlockFutex.is_supported;
+
+            pub fn deinit(self: *UnfairLockImpl) void {
+                self.* = undefined;
+            }
 
             pub fn acquire(self: *UnfairLockImpl) void {
                 darwin.os_unfair_lock_lock(&self.oul);
@@ -624,7 +634,7 @@ const PosixWaitQueue = MutexCondWaitQueue(struct {
 fn MutexCondWaitQueue(comptime MutexCondImpl: type) type {
     return CoreWaitQueue(struct {
         pub const LockImpl = MutexCondImpl.MutexImpl;
-        pub const EventImpl = MutexCondEvent;
+        pub const EventImpl = ThreadEvent(MutexCondEvent);
         pub const InstantImpl = Instant;
         pub const bucket_count = MutexCondImpl.bucket_count;
 
@@ -704,7 +714,7 @@ fn MutexCondWaitQueue(comptime MutexCondImpl: type) type {
 fn FutexWaitQueue(comptime FutexImpl: type) type {
     return CoreWaitQueue(struct {
         pub const LockImpl = FutexLock;
-        pub const EventImpl = FutexEvent;
+        pub const EventImpl = ThreadEvent(FutexEvent);
         pub const InstantImpl = Instant;
         pub const bucket_count = FutexImpl.bucket_count;
 
@@ -716,6 +726,10 @@ fn FutexWaitQueue(comptime FutexImpl: type) type {
                 locked,
                 contended,
             };
+
+            pub fn deinit(self: *FutexLock) void {
+                self.* = undefined;
+            }
 
             pub fn acquire(self: *FutexLock) void {
                 if (atomic.tryCompareAndSwap(
@@ -864,4 +878,36 @@ fn FutexWaitQueue(comptime FutexImpl: type) type {
             }
         };
     });
+}
+
+fn ThreadEvent(comptime EventImpl: type) type {
+    return struct {
+        impl: EventImpl,
+
+        const Self = @This();
+
+        pub fn init(self: *Self) void {
+            return self.impl.init();
+        }
+
+        pub fn deinit(self: *Self) void {
+            return self.impl.deinit();
+        }
+
+        pub fn wait(self: *Self, deadline: ?Instant) error{TimedOut}!void {
+            if (std.builtin.single_threaded and deadline == null) {
+                @panic("deadlock detected");
+            } else {
+                return self.impl.wait(deadline);
+            }
+        }
+
+        pub fn set(self: *Self) void {
+            if (std.builtin.single_threaded) {
+                unreachable;
+            } else {
+                return self.impl.set();
+            }
+        }
+    };
 }

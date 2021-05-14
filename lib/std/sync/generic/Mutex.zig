@@ -18,10 +18,15 @@ pub fn Mutex(comptime WaitQueue: type) type {
             contended,
         };
 
-        const Notify = enum(usize) {
-            Retry,
-            Acquired,
+        const Notify = enum {
+            retry,
+            acquired,
         };
+
+        pub fn deinit(self: *Self) void {
+            std.debug.assert(self.state == .unlocked);
+            self.* = undefined;
+        }
 
         pub fn tryAcquire(self: *Self) ?Held {
             return atomic.compareAndSwap(
@@ -118,34 +123,38 @@ pub fn Mutex(comptime WaitQueue: type) type {
 
                 const WaitContext = struct {
                     mutex: *Self,
+                    notify_ptr: *Notify,
 
                     pub fn onValidate(this: @This()) ?usize {
                         const current_state = atomic.load(&this.mutex.state, .Relaxed);
                         if (current_state != .contended) return null;
-                        return 0;
+                        return @ptrToInt(this.notify_ptr);
                     }
 
                     pub fn onBeforeWait(this: @This()) void {}
                     pub fn onTimedOut(this: @This(), _: WaitQueue.Waiting) void {}
                 };
 
-                const notification = WaitQueue.wait(
+                var notify = Notify.retry;
+                WaitQueue.wait(
                     @ptrToInt(self), 
                     deadline,
-                    WaitContext{ .mutex = self },
+                    WaitContext{
+                        .mutex = self,
+                        .notify_ptr = &notify,
+                    },
                 ) catch |err| switch (err) {
-                    error.Invalidated => Notify.Retry,
+                    error.Invalidated => {},
                     error.TimedOut => return error.TimedOut,
                 };
 
-                switch (@intToEnum(Notify, notification)) {
-                    .Acquired => return,
-                    .Retry => {
+                switch (notify) {
+                    .acquired => return,
+                    .retry => {
                         adaptive_spin = 0;
                         new_state = .contended;
                         state = atomic.load(&self.state, .Relaxed);
-                        continue;
-                    }
+                    },
                 }
             }
         }
@@ -164,13 +173,13 @@ pub fn Mutex(comptime WaitQueue: type) type {
 
         fn releaseFast(self: *Self, comptime be_fair: bool) void {
             if (be_fair) {
-                return self.releaseSlow(Notify.Acquired);
+                return self.releaseSlow(.acquired);
             }
 
             switch (atomic.swap(&self.state, .unlocked, .Release)) {
                 .unlocked => unreachable, // unlocked an unlocked Mutex
                 .locked => {},
-                .contended => _ = self.releaseSlow(Notify.Retry),
+                .contended => _ = self.releaseSlow(.retry),
             }
         }
 
@@ -178,25 +187,27 @@ pub fn Mutex(comptime WaitQueue: type) type {
             @setCold(true);
 
             const WakeContext = struct {
-                did_wake: bool = false,
                 mutex: *Self,
+                did_wake: bool = false,
 
-                pub fn onWake(this: *@This(), _: WaitQueue.Waiting) WaitQueue.Waking {
-                    if (self.did_wake) {
+                pub fn onWake(this: *@This(), waiter: WaitQueue.Waiting) WaitQueue.Waking {
+                    if (this.did_wake) {
                         return .Stop;
                     }
 
-                    self.did_wake = true;
-                    return .{ .Wake = @enumToInt(notify) };
+                    const notify_ptr = @intToPtr(*Notify, waiter.token.*);
+                    notify_ptr.* = notify;
+                    this.did_wake = true;
+                    return .Wake;
                 }
 
                 pub fn onBeforeWake(this: @This()) void {
-                    if (notify == .Acquired and !self.did_wake) {
+                    if (notify == .Acquired and !this.did_wake) {
                         if (std.debug.runtime_safety) {
-                            const state = atomic.load(&self.mutex.state, .Unordered);
+                            const state = atomic.load(&this.mutex.state, .Unordered);
                             std.debug.assert(state == .locked);
                         }
-                        atomic.store(&self.mutex.state, .unlocked, .Release);
+                        atomic.store(&this.mutex.state, .unlocked, .Release);
                     }
                 }
             };

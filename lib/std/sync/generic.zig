@@ -12,9 +12,9 @@
 // - generic RwLock
 
 pub const core = struct {
-    pub const WaitQueue = @import("core/WaitQueue.zig");
-    pub const Mutex = @import("core/Mutex.zig");
-    pub const Futex = @import("core/Futex.zig");
+    pub const WaitQueue = @import("core/WaitQueue.zig").WaitQueue;
+    pub const Mutex = @import("core/Mutex.zig").Mutex;
+    pub const Futex = @import("core/Futex.zig").Futex;
 };
 
 pub fn primitivesFor(comptime WaitQueueImpl: type) type {

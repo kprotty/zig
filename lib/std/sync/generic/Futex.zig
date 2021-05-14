@@ -6,9 +6,7 @@
 
 const std = @import("../../std.zig");
 const atomic = @import("../atomic.zig");
-
 const Duration = std.time.Duration;
-const single_threaded = std.builtin.single_threaded;
 
 //! A Futex provides a method to block and unblock OS threads by
 //! waiting for either a pointer to change value or another thread to send a notification.
@@ -118,12 +116,9 @@ pub fn Futex(comptime WaitQueue: type) type {
                 notifications: usize,
 
                 pub fn onWake(this: *@This(), _: WaitQueue.Waiting) WaitQueue.Waking {
-                    if (self.notifications == 0) {
-                        return .Stop;
-                    }
-
+                    if (self.notifications == 0) return .Stop;
                     self.notifications -= 1;
-                    return .{ .Wake = 0 };
+                    return .Wake;
                 }
 
                 pub fn onBeforeWake(this: @This()) void {}
